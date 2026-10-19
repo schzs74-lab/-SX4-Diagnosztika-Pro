@@ -1,81 +1,94 @@
 package hu.sx4.diagnosztika
 
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.io.InputStream
-import java.io.OutputStream
-import java.util.concurrent.atomic.AtomicBoolean
+import java.net.SocketTimeoutException
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
+/** One serialized command stream; disconnect deliberately never acquires the I/O lock. */
 class Elm327 {
-    private var socket: Socket? = null
-    private var input: InputStream? = null
-    private var output: OutputStream? = null
-    private val busy = AtomicBoolean(false)
+    private val ioLock = Any()
+    private val stateLock = Any()
+    @Volatile private var socket: Socket? = null
+    @Volatile private var ready = false
+    @Volatile var canProtocol: Boolean = false
+        private set
+    @Volatile var supported: Set<Int> = emptySet()
+        private set
+    private val deadlines = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "elm-deadline").apply { isDaemon = true } }
 
-    @Synchronized fun connect(host: String, port: Int): String {
+    fun connect(host: String, port: Int, createSocket: () -> Socket = { Socket() }, cancelled: () -> Boolean = { false }): String = synchronized(ioLock) {
         disconnect()
-        val s = Socket()
-        s.connect(InetSocketAddress(host, port), 3500)
-        s.soTimeout = 3500
-        socket = s; input = s.getInputStream(); output = s.getOutputStream()
-        command("ATZ", 5000)
-        command("ATE0")
-        command("ATL0")
-        command("ATS0")
-        command("ATH0")
-        command("ATSP0", 5000)
-        return command("ATI")
-    }
-    @Synchronized fun command(cmd: String, timeoutMs: Int = 3500): String {
-        val s = socket ?: throw IllegalStateException("Nincs kapcsolat")
-        require(Regex("[A-Za-z0-9 ]{2,16}").matches(cmd)) { "Érvénytelen parancs" }
-        s.soTimeout = timeoutMs
-        val o = output ?: error("Nincs kimenet")
-        val i = input ?: error("Nincs bemenet")
-        while(i.available() > 0) i.read()
-        o.write((cmd + "\r").toByteArray(Charsets.US_ASCII)); o.flush()
-        val buffer = StringBuilder()
-        while (buffer.length < 8192) {
-            val b = i.read()
-            if (b < 0) throw IllegalStateException("A kapcsolat megszakadt")
-            if (b == '>'.code) break
-            buffer.append(b.toChar())
+        require(host.matches(Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}")) && host.split('.').all { it.toInt() in 0..255 }) { "IPv4-cím szükséges" }
+        require(port in 1..65535) { "Hibás TCP-port" }
+        val s = createSocket()
+        synchronized(stateLock) { socket = s }
+        try {
+            check(!cancelled()) { "Megszakított kapcsolódás" }
+            s.connect(InetSocketAddress(host, port), 3500)
+            command("ATZ", 5000)
+            for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1")) {
+                val reply = command(cmd).replace(cmd, "").trim()
+                check(reply == "OK") { "Inicializálás sikertelen ($cmd): $reply" }
+            }
+            val id = command("ATI")
+            // Protocol selection happens only after the first ECU request, not after ATSP0.
+            supported = Obd.pids(command("0100", 12000))
+            val protocolText = command("ATDPN").trim().uppercase(Locale.ROOT)
+            val protocol = (if (protocolText.length == 2) protocolText.removePrefix("A") else protocolText).toIntOrNull(16)
+                ?: error("Ismeretlen OBD-protokoll")
+            check(protocol in 1..12) { "Nem választott OBD-protokollt az adapter" }
+            canProtocol = protocol in 6..10
+            check(!cancelled() && socket === s && !s.isClosed) { "Megszakított kapcsolódás" }
+            ready = true
+            "$id • protokoll: ${protocol.toString(16).uppercase(Locale.ROOT)} • ECU válaszolt"
+        } catch (e: Exception) {
+            disconnect(); throw e
         }
-        val response = buffer.toString().trim()
-        if (response.contains("UNABLE TO CONNECT") || response.contains("NO DATA") || response.contains("ERROR"))
-            throw IllegalStateException("Adapter válasza: $response")
-        return response
     }
-    @Synchronized fun disconnect() {
-        try { socket?.close() } catch (_: Exception) {}
-        socket = null; input = null; output = null
-    }
-    fun isConnected() = socket?.isConnected == true && socket?.isClosed == false
-}
 
-object Obd {
-    // ELM válasz normalizálása: a fejléc nélküli, szóközös és szóköz nélküli formát is kezeli.
-    fun bytesFor(response: String, mode: Int, pid: Int? = null): List<Int> {
-        val hexLines = response.uppercase().lines().map { it.replace(Regex("[^0-9A-F]"), "") }
-        val prefix = "%02X".format(mode + 0x40) + (pid?.let { "%02X".format(it) } ?: "")
-        val data = hexLines.firstOrNull { it.startsWith(prefix) } ?: return emptyList()
-        return data.drop(prefix.length).chunked(2).filter { it.length == 2 }.map { it.toInt(16) }
+    fun command(cmd: String, timeoutMs: Int = 3500): String = synchronized(ioLock) {
+        // Only standard diagnostic reads and the explicitly confirmed Mode 04 are available.
+        require(cmd in setOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1", "ATI", "ATDPN", "03", "04", "07", "0A") ||
+            cmd.matches(Regex("01[0-9A-F]{2}|02[0-9A-F]{2}00"))) { "Nem engedélyezett parancs" }
+        require(timeoutMs > 0)
+        val s = socket ?: error("Nincs kapcsolat")
+        val end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs.toLong())
+        val timeout = deadlines.schedule({ try { s.close() } catch (_: IOException) {} }, timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+        try {
+            val output = s.getOutputStream()
+            val input = s.getInputStream()
+            output.write((cmd + "\r").toByteArray(Charsets.US_ASCII)); output.flush()
+            val buffer = StringBuilder()
+            while (true) {
+                val left = TimeUnit.NANOSECONDS.toMillis(end - System.nanoTime())
+                if (left <= 0) throw SocketTimeoutException("A parancs teljes határideje lejárt")
+                s.soTimeout = left.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
+                val b = input.read()
+                if (b < 0) throw IOException("A kapcsolat megszakadt")
+                if (b == '>'.code) break
+                if (buffer.length >= 32768) throw IOException("Túl hosszú ELM-válasz, prompt nélkül")
+                buffer.append(b.toChar())
+            }
+            val response = buffer.toString().trim()
+            check(response.isNotEmpty()) { "Üres adapterválasz" }
+            // NO DATA is an explicit per-query failure, but the prompt keeps transport aligned.
+            response
+        } catch (e: Exception) {
+            disconnect(); throw e
+        } finally { timeout.cancel(false) }
     }
-    fun pids(r: String): Set<Int> {
-        val b = bytesFor(r, 1, 0)
-        if (b.size < 4) return emptySet()
-        val mask = (b[0].toLong() shl 24) or (b[1].toLong() shl 16) or (b[2].toLong() shl 8) or b[3].toLong()
-        return (1..32).filter { (mask and (1L shl (32-it))) != 0L }.toSet()
-    }
-    fun dtcs(response: String): List<String> {
-        val bytes = bytesFor(response, 3)
-        val codes = mutableListOf<String>()
-        for (n in 0 until bytes.size / 2) {
-            val a = bytes[2*n]; val b = bytes[2*n+1]
-            if (a == 0 && b == 0) continue
-            val prefix = "PCBU"[(a shr 6) and 3]
-            codes += "$prefix${(a shr 4) and 3}${a and 15}${(b shr 4) and 15}${b and 15}"
+
+    fun disconnect() {
+        val previous = synchronized(stateLock) {
+            ready = false
+            val old = socket; socket = null; old
         }
-        return codes
+        try { previous?.close() } catch (_: IOException) {}
     }
+    fun isConnected() = ready && socket?.let { it.isConnected && !it.isClosed } == true
+    fun close() { disconnect(); deadlines.shutdownNow() }
 }
