@@ -38,7 +38,12 @@ class Elm327 {
             }
             val id = command("ATI")
             // Protocol selection happens only after the first ECU request, not after ATSP0.
-            supported = Obd.pids(command("0100", 12000))
+            val first = Obd.pids(command("0100", 12000))
+            // Later pages (0120, 0140 …): a refused page ends the chain, a lost connection aborts connect.
+            supported = Obd.supportChain(first) { base ->
+                try { Obd.pids(command("01%02X".format(base)), base) }
+                catch (e: Exception) { if (socket !== s || s.isClosed) throw e; null }
+            }
             val protocolText = command("ATDPN").trim().uppercase(Locale.ROOT)
             val protocol = (if (protocolText.length == 2) protocolText.removePrefix("A") else protocolText).toIntOrNull(16)
                 ?: error("Ismeretlen OBD-protokoll")
@@ -54,7 +59,7 @@ class Elm327 {
 
     fun command(cmd: String, timeoutMs: Int = 3500): String = synchronized(ioLock) {
         // Only standard diagnostic reads and the explicitly confirmed Mode 04 are available.
-        require(cmd in setOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1", "ATI", "ATDPN", "03", "04", "07", "0A") ||
+        require(cmd in setOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1", "ATI", "ATDPN", "ATRV", "03", "04", "07", "0A") ||
             cmd.matches(Regex("01[0-9A-F]{2}|02[0-9A-F]{2}00"))) { "Nem engedélyezett parancs" }
         require(timeoutMs > 0)
         val s = socket ?: error("Nincs kapcsolat")

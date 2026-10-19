@@ -68,6 +68,31 @@ class Elm327Test {
             } finally { elm.close() }
         }
     }
+    @Test fun supportPagesBeyondFirstAreChained() {
+        Adapter { cmd, s ->
+            val reply = when (cmd) { "0100" -> "41 00 00 10 00 01"; "0120" -> "41 20 80 02 00 00"; else -> null }
+            reply?.let { s.getOutputStream().write("$it\r>".toByteArray()); s.getOutputStream().flush(); true } ?: false
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                assertEquals(setOf(0x0C, 0x20, 0x21, 0x2F), elm.supported)
+            } finally { elm.close() }
+        }
+    }
+    @Test fun refusedSupportPageKeepsConnection() {
+        Adapter { cmd, s ->
+            val reply = when (cmd) { "0100" -> "41 00 00 10 00 01"; "0120" -> "NO DATA"; else -> null }
+            reply?.let { s.getOutputStream().write("$it\r>".toByteArray()); s.getOutputStream().flush(); true } ?: false
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                assertTrue(adapter.connect(elm).contains("ECU válaszolt"))
+                assertTrue(elm.isConnected())
+                assertEquals(setOf(0x0C, 0x20), elm.supported)
+            } finally { elm.close() }
+        }
+    }
     @Test fun initializationFailureClosesTransport() {
         Adapter { cmd, s ->
             if (cmd == "ATE0") { s.getOutputStream().write("?\r>".toByteArray()); true } else false

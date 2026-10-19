@@ -33,11 +33,14 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var values: TextView
     private lateinit var errors: TextView
+    private lateinit var statusReport: TextView
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var demo: Switch
     /** Latest decoded line per PID with its receive time; read and written on the UI thread only. */
     private val latest = LinkedHashMap<Int, Pair<String, Long>>()
+    /** Moving average of one poll (delay + request), the basis of each PID's stale limit. */
+    @Volatile private var avgPollMs = 500L
     private val cm by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -85,6 +88,9 @@ class MainActivity : Activity() {
             }
         }
         button("Hibakódok törlése") { prepareClear() }
+        title("Readiness, Freeze Frame, járműállapot")
+        statusReport = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize = 16f; root.addView(this) }
+        button("Állapot és Freeze Frame olvasása") { readStatus() }
         TextView(this).apply {
             text = "Fejlesztői prototípus. Álló járműnél használd. A hibakódtörlés nem javítja meg a hibát. ECU-paraméterírás és emissziófelügyelet-módosítás nincs beépítve. A törlés előtti mentés részleges, nem teljes járműdiagnosztikai mentés."
             setPadding(0,24,0,20); root.addView(this)
@@ -102,6 +108,20 @@ class MainActivity : Activity() {
         status.text = message
         values.text = "Nincs érvényes mérés"
         errors.text = "Nincs érvényes hibakód-kiolvasás"
+        statusReport.text = "Nincs érvényes állapot-kiolvasás"
+    }
+
+    private fun readStatus() {
+        if (demo.isChecked) {
+            statusReport.text = "DEMO / SZIMULÁLT\nHibalámpa (MIL): BE • ECU szerinti hibakódszám: 1\nKatalizátor: NEM KÉSZ\nLambdaszonda: KÉSZ\n" +
+                "Freeze Frame kiváltó hibakód: P0420\nFordulatszám: 2480.00 1/perc\nHűtőfolyadék: 89 °C"
+            return
+        }
+        statusReport.text = "VALÓDI ECU • állapot-kiolvasás folyamatban… (K-line-on 5–15 s)"
+        task { token ->
+            val sections = VehicleStatus({ elm.command(it) }, elm.supported, { elm.isConnected() }).report()
+            show(token) { statusReport.text = "VALÓDI ECU\n" + sections.joinToString("\n\n") { "▸ ${it.title}\n" + it.lines.joinToString("\n") } }
+        }
     }
 
     private fun connectWifi() {
@@ -163,8 +183,10 @@ class MainActivity : Activity() {
         poll = worker.schedule({
             if (!measuring || token != generation.get() || readingToken != readingGeneration.get()) return@schedule
             val pid = supported[index]
+            val started = System.nanoTime()
             try {
                 val line = Obd.reading(pid, Obd.bytesFor(elm.command("01%02X".format(pid)), 1, pid))
+                avgPollMs = (avgPollMs * 7 + 200 + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)) / 8
                 val at = System.currentTimeMillis()
                 show(token) { if (measuring && readingToken == readingGeneration.get()) { latest[pid] = line to at; renderLatest(supported) } }
             } catch (e: Exception) {
@@ -183,7 +205,7 @@ class MainActivity : Activity() {
         val lines = LivePlan.displayed(sequence.toSet()).map { pid ->
             val entry = latest[pid] ?: return@map "%02X: még nincs érvényes adat".format(pid)
             val age = now - entry.second
-            if (age > LivePlan.staleAfterMs(pid)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
+            if (age > LivePlan.staleAfterMs(pid, sequence, avgPollMs)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
         }
         values.text = "VALÓDI ECU • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + (note?.let { "\n$it" } ?: "")
     }
@@ -217,7 +239,7 @@ class MainActivity : Activity() {
                 .put("timestampUtcMillis", System.currentTimeMillis()).put("complete", false)
                 .put("canProtocol", elm.canProtocol).put("appVersion", BuildConfig.VERSION_NAME)
                 .put("appVersionCode", BuildConfig.VERSION_CODE).put("gitSha", BuildConfig.GIT_SHA)
-                .put("limitations", "RÉSZLEGES: nem teljes Freeze Frame vagy ECU-mentés; csak a felsorolt lekérdezések.")
+                .put("limitations", "RÉSZLEGES: csak a motorvezérlő szabványos OBD-adatai (DTC, readiness, 0. Freeze Frame, járműállapot); más ECU-k és gyártóspecifikus adatok nélkül.")
                 .put("storedDtcRaw", stored).put("storedDtcDecoded", codes.joinToString(","))
             val queries = JSONObject()
             for (cmd in listOf("07", "0A", "0101", "020200", "020000")) {
@@ -243,6 +265,12 @@ class MainActivity : Activity() {
                 }
             }
             report.put("queries", queries)
+            // Decoded readiness, vehicle status and every freeze frame PID the ECU supports.
+            check(token == generation.get()) { "Megszakított mentés" }
+            val decoded = JSONObject()
+            VehicleStatus({ elm.command(it) }, elm.supported, { elm.isConnected() }).report()
+                .forEach { decoded.put(it.title, org.json.JSONArray(it.lines)) }
+            report.put("decodedStatus", decoded)
             val dir = File(filesDir, "diagnostic-backups").apply { check(mkdirs() || isDirectory) }
             val file = File(dir, "partial-${System.currentTimeMillis()}-${java.util.UUID.randomUUID()}.json")
             val content = report.toString(2)
@@ -250,7 +278,7 @@ class MainActivity : Activity() {
             check(file.readText(Charsets.UTF_8) == content) { "A mentés visszaolvasása sikertelen; törlés tiltva" }
             show(token) {
                 clearDialog = AlertDialog.Builder(this).setTitle("Részleges mentés elkészült. Törlöd a hibakódokat?")
-                    .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt DTC és a felsorolt kiegészítő lekérdezések. Nem teljes Freeze Frame-mentés; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél, ráadott gyújtással és LEÁLLÍTOTT motorral: a 04 elküldése előtt az alkalmazás frissen ellenőrzi, hogy a fordulatszám és a sebesség 0. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
+                    .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt és függő DTC, readiness, a 0. Freeze Frame összes támogatott PID-je és járműállapot. Más ECU-k és gyártóspecifikus adatok nincsenek benne; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél, ráadott gyújtással és LEÁLLÍTOTT motorral: a 04 elküldése előtt az alkalmazás frissen ellenőrzi, hogy a fordulatszám és a sebesség 0. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
                     .setNegativeButton("Mégsem", null)
                     .setPositiveButton("Részleges mentéssel is törlöm") { _, _ ->
                         if (token == generation.get() && !demo.isChecked) task { clearToken ->

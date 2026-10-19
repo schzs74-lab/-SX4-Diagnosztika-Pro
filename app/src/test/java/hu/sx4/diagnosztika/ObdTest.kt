@@ -92,7 +92,7 @@ class ObdTest {
         assertEquals("Beszívott levegő: 25 °C", Obd.reading(0x0F, listOf(65)))
         assertEquals("Légtömegáram (MAF): 2.56 g/s", Obd.reading(0x10, listOf(1, 0)))
         rejected { Obd.reading(0x10, listOf(1)) }
-        rejected { Obd.reading(0x42, listOf(1, 2)) }
+        rejected { Obd.reading(0x99, listOf(1, 2)) }
     }
     @Test fun clearRequiresStoppedEngineAndStationaryVehicle() {
         assertNull(Obd.clearBlockReason(listOf(0, 0), listOf(0), true))
@@ -103,5 +103,59 @@ class ObdTest {
         assertNotNull(Obd.clearBlockReason(listOf(0, 0), null, true))
         assertNotNull(Obd.clearBlockReason(null, listOf(0), true))
         assertNotNull(Obd.clearBlockReason(listOf(0), listOf(0), true))
+    }
+    @Test fun extendedPidDecoders() {
+        assertEquals("Üzemanyag-rendszer: zárt kör (lambdaszabályozás)", Obd.reading(0x03, listOf(2, 0)))
+        assertTrue(Obd.reading(0x03, listOf(1, 4)).contains("2. rendszer: nyitott kör (terhelés"))
+        assertEquals("Lambdaszondák: B1: S1,S2 • B2: –", Obd.reading(0x13, listOf(0x03)))
+        assertEquals("OBD-szabvány: EOBD (Európa)", Obd.reading(0x1C, listOf(6)))
+        assertEquals("Megtett út égő hibalámpával: 300 km", Obd.reading(0x21, listOf(1, 44)))
+        assertEquals("O2 S1 (széles sávú): λ 1.000; 4.000 V", Obd.reading(0x24, listOf(0x80, 0, 0x80, 0)))
+        assertEquals("Üzemanyagszint: 50.2 %", Obd.reading(0x2F, listOf(128)))
+        assertEquals("Katalizátor-hőmérséklet B1S1: 460.0 °C", Obd.reading(0x3C, listOf(0x13, 0x88)))
+        assertEquals("ECU tápfeszültség: 13.80 V", Obd.reading(0x42, listOf(0x35, 0xE8)))
+        assertEquals("Előírt lambda: 1.000", Obd.reading(0x44, listOf(0x80, 0)))
+        assertEquals("Külső hőmérséklet: 18 °C", Obd.reading(0x46, listOf(58)))
+        assertEquals("Idő a hibakódtörlés óta: 258 perc", Obd.reading(0x4E, listOf(1, 2)))
+        rejected { Obd.reading(0x24, listOf(0x80, 0)) }
+        assertFalse(Obd.decodable(0x99))
+    }
+    @Test fun supportChainFollowsNextPageBitsAndStopsOnRefusal() {
+        val pages = mapOf(0x20 to setOf(0x21, 0x2F, 0x40), 0x40 to setOf(0x42, 0x46))
+        val asked = mutableListOf<Int>()
+        assertEquals(setOf(0x0C, 0x20, 0x21, 0x2F, 0x40, 0x42, 0x46),
+            Obd.supportChain(setOf(0x0C, 0x20)) { asked += it; pages[it] })
+        assertEquals(listOf(0x20, 0x40), asked)
+        assertEquals(setOf(0x0C), Obd.supportChain(setOf(0x0C)) { error("nem kérdezhető") })
+        assertEquals(setOf(0x0C, 0x20), Obd.supportChain(setOf(0x0C, 0x20)) { null })
+        // Every page claims a next one: the chain still never asks beyond page E0.
+        asked.clear()
+        Obd.supportChain(setOf(0x20)) { asked += it; setOf(it + 0x20) }
+        assertEquals((0x20..0xE0 step 0x20).toList(), asked)
+    }
+    @Test fun readinessSparkIgnition() {
+        // MIL on, 1 DTC; misfire+fuel+components supported, fuel incomplete; cat, EVAP, O2, O2 heater supported; cat and EVAP incomplete.
+        val r = Obd.readiness(listOf(0x81, 0x27, 0x65, 0x05))
+        assertTrue(r.mil); assertEquals(1, r.dtcCount); assertTrue(r.sparkIgnition)
+        val m = r.monitors.associateBy { it.name }
+        assertEquals(Obd.Monitor("Üzemanyag-rendszer", true, false), m["Üzemanyag-rendszer"])
+        assertEquals(Obd.Monitor("Gyújtáskimaradás", true, true), m["Gyújtáskimaradás"])
+        assertEquals(Obd.Monitor("Katalizátor", true, false), m["Katalizátor"])
+        assertEquals(Obd.Monitor("Lambdaszonda", true, true), m["Lambdaszonda"])
+        assertFalse(m.getValue("EGR-rendszer").supported)
+        val lines = Obd.readinessLines(r)
+        assertEquals("Hibalámpa (MIL): BE • ECU szerinti hibakódszám: 1", lines.first())
+        assertTrue(lines.contains("Katalizátor: NEM KÉSZ"))
+        assertTrue(lines.last().startsWith("Nem támogatott: ") && lines.last().contains("EGR-rendszer"))
+        rejected { Obd.readiness(listOf(0, 0, 0)) }
+    }
+    @Test fun freezeFrameFrames() {
+        assertEquals(setOf(0x02, 0x04, 0x05, 0x0C, 0x20), Obd.freezeFramePids("42 00 00 58 10 00 01", 0))
+        assertEquals(listOf(0x1A, 0xF8), Obd.freezeFrameData("42 0C 00 1A F8", 0x0C))
+        assertEquals("P0420", Obd.freezeFrameDtc(Obd.freezeFrameData("42 02 00 04 20", 2)))
+        assertNull(Obd.freezeFrameDtc(Obd.freezeFrameData("42 02 00 00 00", 2)))
+        rejected { Obd.freezeFrameData("42 0C 01 1A F8", 0x0C) }   // not frame 0
+        rejected { Obd.freezeFramePids("42 00 00 58 10 00", 0) }
+        rejected { Obd.freezeFrameDtc(listOf(4)) }
     }
 }

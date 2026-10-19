@@ -94,7 +94,7 @@ Az „ebben az ágban” oszlop jelzi, mi készült el ebben a PR-ban (`claude/s
 
 #### N8 – Közepes: hiányzó alapvető PID-ek, csak az első támogatási oldal
 - **Ok, fájl:** `MainActivity.items`, `Elm327.connect` (csak `0100`). Nem olvasott terhelés (04), MAP (0B), MAF (10), gyújtás (0E), szívott levegő (0F). Hiányzik a `0120/0140/0160…` lánc, a 03 (üzemanyag-rendszer nyitott/zárt kör) és a 13 (O2-szondák helye).
-- **Javítás:** a 04, 0B, 0E, 0F, 10 PID elkészült, tesztelt képletekkel. **Javasolt még:** támogatási lánc követése (a 0x20, 0x40… bit jelzi a következő oldalt), PID 03 és 13 kezelése, 0x42 modulfeszültség vagy `ATRV`.
+- **Javítás:** a 04, 0B, 0E, 0F, 10 PID elkészült, tesztelt képletekkel. **Utólag elkészült (külön PR):** a támogatási lánc követése (0120…01E0), a 03, 13, 1C, 1F, 21, 24, 25, 2F, 30, 31, 33, 3C, 42–46, 4D, 4E PID-ek, `ATRV`, dekódolt readiness és a teljes 0. Freeze Frame.
 
 #### N9 – Közepes: a kódban fix 200 ms szünet és egyenletes körforgás
 - **Ok:** K-line-on egy kérés kb. 100–300 ms (P2/P3 időzítés). 13 PID egyenletes körforgásával az RPM 4–6 s-onként frissülne.
@@ -296,11 +296,12 @@ Helyben futtatva: **28/28 sikeres** (JVM, Kotlin 2.0.21). Az Android-fordítást
 | **P0** | N3 törlés csak álló motornál és járműnél | ✅ |
 | **P1** | Első valós autós próba: nyers `ATI/ATDPN/0100/0120/0113/03` napló mentése és megosztása | következő lépés |
 | **P1** | N4 üdvözlőszöveg, N7 élőadat-tábla, N8 új PID-ek, N9 prioritásos lekérdezés, N13 forgatás | ✅ |
-| **P1** | N11 válaszadó ECU szűrése (`ATH1`), támogatási lánc (0120…), PID 03/13 | javasolt |
+| **P1** | Támogatási lánc (0120…), PID 03/13 és további PID-ek, readiness, teljes Freeze Frame | ✅ (külön PR) |
+| **P1** | N11 válaszadó ECU szűrése (`ATH1`) | javasolt |
 | **P1** | N5 kíméletes időtúllépés-kezelés + olvasási újracsatlakozás | javasolt |
 | **P2** | N6 előtérszolgáltatás + ViewModel; CSV-napló + SAF-export | javasolt |
 | **P2** | Többcsatornás grafikon | javasolt |
-| **P2** | P0420 modul (3. fejezet), Freeze Frame teljes kiolvasás, Mode 06 nyers megjelenítés | javasolt |
+| **P2** | P0420 modul (3. fejezet), Mode 06 nyers megjelenítés | javasolt |
 | **P2** | `ClearController` kiemelése + Robolectric tesztek | javasolt |
 | **P3** | N10 alhálózat-ellenőrzés, N14 erőforrások/ikon, N15 `ATWS` + protokoll-memória, release-workflow | javasolt |
 | **–** | ECU-írás, aktív tesztek, adaptációk | **nem kezdődik el** dokumentált protokoll és a 4.3 keretrendszer nélkül |

@@ -138,25 +138,125 @@ object Obd {
                 require(bytes.chunked(2).none { it == listOf(0, 0) }) { "Érvénytelen nullakód a CAN számlálóban" }
             }
             require(bytes.size % 2 == 0) { "Csonka hibakód" }
-            bytes.chunked(2).filter { it != listOf(0, 0) }.map { (a, b) ->
-                "%c%d%X%02X".format("PCBU"[(a shr 6) and 3], (a shr 4) and 3, a and 15, b)
-            }
+            bytes.chunked(2).filter { it != listOf(0, 0) }.map { (a, b) -> dtc(a, b) }
         }.distinct()
+
+    private fun dtc(a: Int, b: Int) = "%c%d%X%02X".format("PCBU"[(a shr 6) and 3], (a shr 4) and 3, a and 15, b)
+
+    /**
+     * Follows the support pages 0x00 → 0x20 → … → 0xE0 while the "next page supported" bit (PID base+0x20)
+     * is set. [fetch] returns null when the ECU refuses a page; the chain then ends with what is known.
+     */
+    fun supportChain(first: Set<Int>, fetch: (base: Int) -> Set<Int>?): Set<Int> {
+        val all = first.toMutableSet()
+        var base = 0
+        while (base + 0x20 <= 0xE0 && base + 0x20 in all) {
+            base += 0x20
+            all += fetch(base) ?: break
+        }
+        return all
+    }
+
+    /** Mode 02 support mask of freeze frame 0: reply `42 <base> 00 <4 mask bytes>`. */
+    fun freezeFramePids(response: String, base: Int = 0): Set<Int> {
+        require(base in 0..0xE0 && base % 32 == 0)
+        val data = freezeFrameData(response, base)
+        require(data.size == 4) { "Csonka vagy hibás Freeze Frame támogatási maszk" }
+        val mask = data.fold(0L) { value, byte -> (value shl 8) or byte.toLong() }
+        return (1..32).filter { mask and (1L shl (32 - it)) != 0L }.map { base + it }.toSet()
+    }
+
+    /** Data bytes of one PID from freeze frame 0, without the frame number. */
+    fun freezeFrameData(response: String, pid: Int): List<Int> {
+        val data = bytesFor(response, 2, pid)
+        require(data.firstOrNull() == 0) { "Nem a 0. Freeze Frame válasza" }
+        return data.drop(1)
+    }
+
+    /** Freeze frame PID 02: the DTC that stored the frame; null when no frame is stored (`00 00`). */
+    fun freezeFrameDtc(data: List<Int>): String? {
+        require(data.size == 2) { "Csonka Freeze Frame hibakód" }
+        return if (data == listOf(0, 0)) null else dtc(data[0], data[1])
+    }
+
+    data class Monitor(val name: String, val supported: Boolean, val complete: Boolean)
+    data class Readiness(val mil: Boolean, val dtcCount: Int, val sparkIgnition: Boolean, val monitors: List<Monitor>)
+
+    /** PID 01 (SAE J1979): MIL, ECU DTC count and monitor support / completion. */
+    fun readiness(data: List<Int>): Readiness {
+        require(data.size == 4) { "Csonka readiness-adat (0101)" }
+        val (a, b, c, d) = data
+        val continuous = listOf("Gyújtáskimaradás", "Üzemanyag-rendszer", "Alkatrészek").mapIndexed { i, name ->
+            Monitor(name, (b shr i) and 1 == 1, (b shr (i + 4)) and 1 == 0)
+        }
+        val spark = b and 0x08 == 0
+        val names = if (spark) listOf("Katalizátor", "Fűtött katalizátor", "EVAP-rendszer", "Szekunder levegő",
+            "Klíma hűtőközeg", "Lambdaszonda", "Lambdaszonda-fűtés", "EGR-rendszer")
+        else listOf("NMHC-katalizátor", "NOx/SCR", "Fenntartott", "Feltöltőnyomás", "Fenntartott",
+            "Kipufogógáz-érzékelő", "Részecskeszűrő", "EGR/VVT")
+        val periodic = names.mapIndexed { i, name -> Monitor(name, (c shr i) and 1 == 1, (d shr i) and 1 == 0) }
+        return Readiness(a and 0x80 != 0, a and 0x7F, spark, continuous + periodic)
+    }
+
+    fun readinessLines(r: Readiness): List<String> =
+        listOf("Hibalámpa (MIL): ${if (r.mil) "BE" else "KI"} • ECU szerinti hibakódszám: ${r.dtcCount}") +
+            r.monitors.filter { it.supported }.map { "${it.name}: ${if (it.complete) "KÉSZ" else "NEM KÉSZ"}" } +
+            r.monitors.filter { !it.supported }.map { it.name }.let {
+                if (it.isEmpty()) emptyList() else listOf("Nem támogatott: " + it.joinToString(", "))
+            }
 
     fun clearAcknowledged(response: String): Boolean = try {
         payloads(response, 4).all { it.data.isEmpty() }
     } catch (_: Exception) { false }
 
+    /** Data length of every Mode 01/02 PID [reading] can decode. */
+    private val pidLength = mapOf(
+        0x03 to 2, 0x04 to 1, 0x05 to 1, 0x06 to 1, 0x07 to 1, 0x0B to 1, 0x0C to 2, 0x0D to 1, 0x0E to 1,
+        0x0F to 1, 0x10 to 2, 0x11 to 1, 0x13 to 1, 0x14 to 2, 0x15 to 2, 0x1C to 1, 0x1F to 2, 0x21 to 2,
+        0x24 to 4, 0x25 to 4, 0x2F to 1, 0x30 to 1, 0x31 to 2, 0x33 to 1, 0x3C to 2, 0x42 to 2, 0x43 to 2,
+        0x44 to 2, 0x45 to 1, 0x46 to 1, 0x4D to 2, 0x4E to 2,
+    )
+    fun decodable(pid: Int) = pid in pidLength
+
+    private fun fuelSystem(v: Int) = when (v) {
+        1 -> "nyitott kör (a zárt kör feltételei még nem teljesülnek)"
+        2 -> "zárt kör (lambdaszabályozás)"
+        4 -> "nyitott kör (terhelés vagy motorfék miatt)"
+        8 -> "nyitott kör (rendszerhiba miatt)"
+        16 -> "zárt kör, de visszacsatolási hiba"
+        else -> "ismeretlen állapot (%02X)".format(v)
+    }
+
+    private val obdStandards = mapOf(1 to "OBD-II (CARB)", 2 to "OBD (EPA)", 3 to "OBD és OBD-II", 4 to "OBD-I",
+        5 to "nem OBD-kompatibilis", 6 to "EOBD (Európa)", 7 to "EOBD és OBD-II", 8 to "EOBD és OBD",
+        9 to "EOBD, OBD és OBD-II", 10 to "JOBD (Japán)", 11 to "JOBD és OBD-II", 12 to "JOBD és EOBD", 13 to "JOBD, EOBD és OBD-II")
+
     fun reading(pid: Int, data: List<Int>): String {
-        val length = when (pid) {
-            0x0C, 0x10, 0x14, 0x15 -> 2
-            0x04, 0x05, 0x06, 0x07, 0x0B, 0x0D, 0x0E, 0x0F, 0x11 -> 1
-            else -> error("Ismeretlen mérési PID")
-        }
+        val length = pidLength[pid] ?: error("Ismeretlen mérési PID")
         require(data.size == length) { "Csonka vagy hibás mérési adat: %02X".format(pid) }
         val a = data[0]; val b = data.getOrElse(1) { 0 }
+        val ab = 256 * a + b
         fun f(value: Double, digits: Int = 1) = String.format(Locale.ROOT, "%.${digits}f", value)
         return when (pid) {
+            0x03 -> "Üzemanyag-rendszer: ${fuelSystem(a)}" + (if (b != 0) " • 2. rendszer: ${fuelSystem(b)}" else "")
+            0x13 -> "Lambdaszondák: B1: " + ((0..3).filter { (a shr it) and 1 == 1 }.joinToString(",") { "S${it + 1}" }.ifEmpty { "–" }) +
+                " • B2: " + ((0..3).filter { (a shr (it + 4)) and 1 == 1 }.joinToString(",") { "S${it + 1}" }.ifEmpty { "–" })
+            0x1C -> "OBD-szabvány: ${obdStandards[a] ?: "egyéb ($a)"}"
+            0x1F -> "Motorjárás az indítás óta: $ab s"
+            0x21 -> "Megtett út égő hibalámpával: $ab km"
+            0x24, 0x25 -> "O2 S${pid - 0x23} (széles sávú): λ ${f(ab * 2.0 / 65536, 3)}; ${f((256 * data[2] + data[3]) * 8.0 / 65536, 3)} V"
+            0x2F -> "Üzemanyagszint: ${f(a * 100.0 / 255)} %"
+            0x30 -> "Bemelegedések a törlés óta: $a"
+            0x31 -> "Megtett út a törlés óta: $ab km"
+            0x33 -> "Légköri nyomás: $a kPa"
+            0x3C -> "Katalizátor-hőmérséklet B1S1: ${f(ab / 10.0 - 40)} °C"
+            0x42 -> "ECU tápfeszültség: ${f(ab / 1000.0, 2)} V"
+            0x43 -> "Abszolút terhelés: ${f(ab * 100.0 / 255)} %"
+            0x44 -> "Előírt lambda: ${f(ab / 32768.0, 3)}"
+            0x45 -> "Relatív fojtószelep: ${f(a * 100.0 / 255)} %"
+            0x46 -> "Külső hőmérséklet: ${a - 40} °C"
+            0x4D -> "Idő égő hibalámpával: $ab perc"
+            0x4E -> "Idő a hibakódtörlés óta: $ab perc"
             0x04 -> "Számított terhelés: ${f(a * 100.0 / 255)} %"
             0x0B -> "Szívócső-nyomás (MAP): $a kPa"
             0x0E -> "Gyújtási előgyújtás: ${f(a / 2.0 - 64)} °"

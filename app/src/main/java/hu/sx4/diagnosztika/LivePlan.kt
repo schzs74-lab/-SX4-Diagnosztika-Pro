@@ -6,8 +6,9 @@ package hu.sx4.diagnosztika
  * Fast PIDs are read every cycle, slow ones one per cycle.
  */
 object LivePlan {
-    val fast = listOf(0x0C, 0x04, 0x11, 0x06, 0x14, 0x15, 0x0B, 0x10)
-    val slow = listOf(0x05, 0x07, 0x0D, 0x0F, 0x0E)
+    /** 24 and 44 only exist with a wideband upstream sensor; then they replace 14 as the fast lambda signal. */
+    val fast = listOf(0x0C, 0x04, 0x11, 0x06, 0x14, 0x15, 0x24, 0x44, 0x0B, 0x10)
+    val slow = listOf(0x05, 0x07, 0x03, 0x0D, 0x0F, 0x0E, 0x25, 0x43, 0x45, 0x2F, 0x42, 0x33, 0x46, 0x3C)
 
     /** One full polling period; only PIDs the ECU reported in its support mask are included. */
     fun sequence(supported: Set<Int>): List<Int> {
@@ -19,6 +20,17 @@ object LivePlan {
     /** Display order: fast group first, then slow. */
     fun displayed(supported: Set<Int>): List<Int> = (fast + slow).filter { it in supported }
 
-    /** A value older than this is shown as stale, never as a current measurement. */
-    fun staleAfterMs(pid: Int): Long = if (pid in fast) 4_000 else 30_000
+    /** Polls between two reads of [pid] in [sequence] (rounded up). */
+    fun pollsBetween(pid: Int, sequence: List<Int>): Int {
+        val count = sequence.count { it == pid }
+        require(count > 0) { "A PID nincs a lekérdezési tervben" }
+        return (sequence.size + count - 1) / count
+    }
+
+    /**
+     * A value is stale when it has missed more than about two of its own refreshes, measured with the
+     * observed average poll duration; never less than 2 s.
+     */
+    fun staleAfterMs(pid: Int, sequence: List<Int>, avgPollMs: Long): Long =
+        maxOf(2_000L, (2.5 * pollsBetween(pid, sequence) * avgPollMs).toLong())
 }
