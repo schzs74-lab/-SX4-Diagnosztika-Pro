@@ -1,5 +1,7 @@
 name: Android APK fordítás
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   push:
     branches: [main]
@@ -28,11 +30,21 @@ jobs:
           log-accepted-android-sdk-licenses: false
       - name: Android 35 SDK telepítése
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Debug APK építése
-        run: gradle :app:assembleDebug --stacktrace
+      - name: OBD és TCP tesztek, lint, debug APK
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace
+      - name: Tesztjelentések feltöltése
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SX4-test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results-debug.*
       - name: APK feltöltése
         uses: actions/upload-artifact@v4
         with:
           name: SX4-Diagnosztika-Pro-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+

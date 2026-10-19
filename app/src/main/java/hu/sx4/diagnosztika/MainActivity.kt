@@ -2,114 +2,249 @@ package hu.sx4.diagnosztika
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.os.Bundle
+import android.content.Context
 import android.graphics.Color
-import android.view.View
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.os.Bundle
 import android.widget.*
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : Activity() {
     private val elm = Elm327()
-    private val worker = Executors.newSingleThreadExecutor()
-    private val measuring = AtomicBoolean(false)
+    private val worker = Executors.newSingleThreadScheduledExecutor()
+    private val generation = AtomicInteger()
+    @Volatile private var measuring = false
+    @Volatile private var active = false
+    @Volatile private var poll: ScheduledFuture<*>? = null
+    private val readingGeneration = AtomicInteger()
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var connecting = false
+    private var operation = false
+    private var clearDialog: AlertDialog? = null
     private lateinit var status: TextView
     private lateinit var values: TextView
     private lateinit var errors: TextView
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var demo: Switch
-    private var latestCodes: List<String> = emptyList()
-    private val descriptions = mapOf("P0420" to "Katalizátor hatásfoka a küszöb alatt (1. hengersor)")
+    private val items = listOf(0x0C, 0x05, 0x0D, 0x06, 0x07, 0x11, 0x14, 0x15)
+    private val cm by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 30, 28, 30) }
         scroll.addView(root); setContentView(scroll)
+        root.setOnApplyWindowInsetsListener { view, insets ->
+            view.setPadding(28 + insets.systemWindowInsetLeft, 30 + insets.systemWindowInsetTop,
+                28 + insets.systemWindowInsetRight, 30 + insets.systemWindowInsetBottom)
+            insets
+        }
         fun title(s: String) = TextView(this).apply { text = s; textSize = 22f; setTextColor(Color.rgb(20,55,72)); setPadding(0,18,0,12); root.addView(this) }
         fun button(s: String, action: () -> Unit) = Button(this).apply { text = s; setOnClickListener { action() }; root.addView(this) }
-        fun field(value: String, hint: String): EditText = EditText(this).apply { setText(value); this.hint = hint; setSingleLine(true); root.addView(this) }
+        fun field(value: String, hint: String) = EditText(this).apply { setText(value); this.hint = hint; setSingleLine(true); root.addView(this) }
         title("SX4 Diagnosztika Pro")
-        TextView(this).apply { text="Suzuki SX4 2007 • M15A • kísérleti 0.1 verzió"; root.addView(this) }
-        status = TextView(this).apply { text = "Nincs kapcsolat"; textSize = 17f; setPadding(0,15,0,15); root.addView(this) }
-        host = field("192.168.0.10", "Adapter IP-címe")
+        TextView(this).apply { text = "Suzuki SX4 2007 • M15A • kísérleti 0.1 verzió"; root.addView(this) }
+        status = TextView(this).apply { text = "DEMO mód • nincs ECU-kapcsolat"; textSize = 17f; root.addView(this) }
+        host = field("192.168.0.10", "Adapter IPv4-címe")
         port = field("35000", "TCP-port").apply { inputType = 2 }
         demo = Switch(this).apply { text = "DEMO mód – szimulált adatok"; isChecked = true; root.addView(this) }
-        button("Csatlakozás az adapterhez") {
-            if (demo.isChecked) { status.text = "DEMO mód: nincs valódi ECU-kapcsolat"; return@button }
-            val ip = host.text.toString().trim(); val p = port.text.toString().toIntOrNull()
-            if (p == null || p !in 1..65535) { status.text="Hibás TCP-port"; return@button }
-            status.text="Kapcsolódás…"
-            runTask {
-                val id = elm.connect(ip,p)
-                show { status.text = "Adapter válaszol: $id" }
+        button("Csatlakozás az adapterhez") { connectWifi() }
+        button("Kapcsolat bontása") { resetSession("Kapcsolat bontva • a korábbi adatok érvénytelenek") }
+        title("Élő motoradatok")
+        values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
+        button("Élő adatok indítása") { startReading() }
+        button("Mérés leállítása") {
+            measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+            values.text = "Mérés leállítva • a korábbi kijelzés érvénytelen"
+        }
+        title("Hibakód-diagnosztika")
+        errors = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize = 16f; root.addView(this) }
+        button("Tárolt hibakódok olvasása") {
+            if (demo.isChecked) errors.text = "DEMO / SZIMULÁLT\nP0420 – Katalizátor hatásfoka a küszöb alatt (1. hengersor)"
+            else {
+                errors.text = "VALÓDI ECU • hibakód-kiolvasás folyamatban…"
+                task { token ->
+                val codes = Obd.dtcs(elm.command("03"), elm.canProtocol)
+                show(token) { errors.text = "VALÓDI ECU • tárolt hibakódok\n" + codes.ifEmpty { listOf("Nincs tárolt hibakód a sikeresen dekódolt válaszban") }.joinToString("\n") }
+                }
             }
         }
-        button("Kapcsolat bontása") { measuring.set(false); worker.execute { elm.disconnect(); show { status.text="Nincs kapcsolat" } } }
-        title("Élő motoradatok")
-        values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; setPadding(0,10,0,15); root.addView(this) }
-        button("Élő adatok indítása") { startReading() }
-        button("Mérés leállítása") { measuring.set(false) }
-        title("Hibakód-diagnosztika")
-        errors = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize=16f; setPadding(0,10,0,15); root.addView(this) }
-        button("Tárolt hibakódok olvasása") {
-            if (demo.isChecked) { latestCodes=listOf("P0420"); errors.text="DEMO • P0420 – ${descriptions["P0420"]}" }
-            else runTask { val c=Obd.dtcs(elm.command("03")); latestCodes=c; show { errors.text=if(c.isEmpty()) "Nem érkezett értelmezhető tárolt hibakód" else c.joinToString("\n") { "$it – ${descriptions[it] ?: "Gyártóspecifikus vagy ismeretlen hibakód"}" } } }
+        button("Hibakódok törlése") { prepareClear() }
+        TextView(this).apply {
+            text = "Fejlesztői prototípus. Álló járműnél használd. A hibakódtörlés nem javítja meg a hibát. ECU-paraméterírás és emissziófelügyelet-módosítás nincs beépítve. A törlés előtti mentés részleges, nem teljes járműdiagnosztikai mentés."
+            setPadding(0,24,0,20); root.addView(this)
         }
-        button("Hibakódok törlése") {
-            if (demo.isChecked) { status.text="DEMO módban a törlés tiltva"; return@button }
-            if (!elm.isConnected()) { status.text="Előbb csatlakozz az adapterhez"; return@button }
-            AlertDialog.Builder(this).setTitle("Hibakódok törlése?")
-                .setMessage("A 04 parancs törölheti a tárolt hibakódokat, a Freeze Frame adatokat, és alaphelyzetbe állíthatja a readiness monitorokat. Az alkalmazás a törlés előtti tárolt hibakódválaszt lokálisan menti, de a Freeze Frame mentése ebben a verzióban még nem teljes. Csak álló járműnél végezd el. Folytatod?")
-                .setNegativeButton("Mégsem", null)
-                .setPositiveButton("Igen, törlés") { _, _ -> runTask { val before = elm.command("03")
-                    getSharedPreferences("diagnosztika", MODE_PRIVATE).edit()
-                        .putString("torles_elotti_hibakodok", before)
-                        .putLong("torles_idopont", System.currentTimeMillis()).apply()
-                    val r=elm.command("04"); if (r.contains("44")) { latestCodes=emptyList(); show { errors.text="Törlés visszaigazolva. Olvasd ki ismét a hibakódokat." } } else show { status.text="Nem igazolt a törlés: $r" } } }.show()
-        }
-        TextView(this).apply { text="Figyelem: az alkalmazás fejlesztői prototípus. Csak a motor szabványos OBD2 funkcióit célozza. A hibakódtörlés nem javítja meg a hibát. Az emisszióellenőrzés átírása nincs beépítve."; setPadding(0,24,0,20); root.addView(this) }
+        demo.setOnCheckedChangeListener { _, checked -> resetSession(if (checked) "DEMO mód • nincs ECU-kapcsolat" else "VALÓDI mód • előbb csatlakozz") }
     }
-    private fun startReading() {
-        if (!measuring.compareAndSet(false,true)) return
-        if (demo.isChecked) {
-            values.text="DEMO / SZIMULÁLT\nFordulatszám: 780 1/perc\nHűtőfolyadék: 88 °C\nSebesség: 0 km/h\nSTFT: +3,1%\nLTFT: +5,5%\nFojtószelep: 12%"
-            measuring.set(false); return
+
+    private fun resetSession(message: String) {
+        generation.incrementAndGet(); measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+        connecting = false; operation = false
+        clearDialog?.dismiss(); clearDialog = null
+        elm.disconnect()
+        networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: IllegalArgumentException) {} }
+        networkCallback = null
+        status.text = message
+        values.text = "Nincs érvényes mérés"
+        errors.text = "Nincs érvényes hibakód-kiolvasás"
+    }
+
+    private fun connectWifi() {
+        if (demo.isChecked) { status.text = "DEMO mód • nincs valódi ECU-kapcsolat"; return }
+        if (connecting || operation) return
+        val ip = host.text.toString().trim()
+        val p = port.text.toString().toIntOrNull()
+        if (!ip.matches(Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}")) || ip.split('.').any { it.toInt() !in 0..255 } || p == null || p !in 1..65535) {
+            status.text = "Érvényes IPv4-cím és 1–65535 közötti port szükséges"; return
         }
-        if (!elm.isConnected()) { measuring.set(false); status.text="Előbb csatlakozz az adapterhez"; return }
-        worker.execute {
-            try {
-                val supported = Obd.pids(elm.command("0100"))
-                val items = listOf(0x0C,0x05,0x0D,0x06,0x07,0x11,0x14,0x15)
-                while(measuring.get()) {
-                    val readings = mutableListOf<String>()
-                    for(pid in items.filter{it in supported}) {
-                        if(!measuring.get()) break
-                        val bytes=Obd.bytesFor(elm.command("01%02X".format(pid)),1,pid)
-                        if (bytes.isEmpty()) continue
-                        val a=bytes[0]; val b=bytes.getOrElse(1){0}
-                        val line = when(pid) {
-                            0x0C -> "Fordulatszám: ${(256*a+b)/4} 1/perc"
-                            0x05 -> "Hűtőfolyadék: ${a-40} °C"
-                            0x0D -> "Sebesség: $a km/h"
-                            0x06 -> "STFT B1: ${"%.1f".format((a-128)*100.0/128)} %"
-                            0x07 -> "LTFT B1: ${"%.1f".format((a-128)*100.0/128)} %"
-                            0x11 -> "Fojtószelep: ${"%.1f".format(a*100.0/255)} %"
-                            0x14 -> "O2 B1S1: ${"%.3f".format(a/200.0)} V; korrekció: ${"%.1f".format((b-128)*100.0/128)} %"
-                            0x15 -> "O2 B1S2: ${"%.3f".format(a/200.0)} V; korrekció: ${"%.1f".format((b-128)*100.0/128)} %"
-                            else -> ""
-                        }
-                        if (line.isNotEmpty()) readings += line
+        resetSession("Wi-Fi hálózat keresése… Csatlakozz az adapter hálózatához internet nélkül is.")
+        connecting = true
+        val token = generation.get()
+        var selected: Network? = null
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = show(token) {
+                if (selected != null) return@show
+                selected = network
+                status.text = "Wi-Fi TCP-kapcsolódás…"
+                worker.execute {
+                    if (token != generation.get()) return@execute
+                    try {
+                        val id = elm.connect(ip, p, { network.socketFactory.createSocket() }, { token != generation.get() })
+                        show(token) { connecting = false; status.text = "VALÓDI • $id" }
+                    } catch (e: Exception) {
+                        show(token) { resetSession("Kapcsolódási hiba: ${e.message}") }
                     }
-                    show { values.text="VALÓDI ECU-ADATOK\n"+(readings.ifEmpty { listOf("A vezérlő nem adott ki támogatott adatot") }.joinToString("\n")) }
-                    Thread.sleep(600)
                 }
-            } catch(e:Exception) { show { status.text="Olvasási hiba: ${e.message}" } }
-            finally { measuring.set(false) }
+            }
+            override fun onLost(network: Network) = show(token) {
+                if (network == selected) resetSession("Az adapter Wi-Fi-kapcsolata megszakadt")
+            }
+            override fun onUnavailable() = show(token) { resetSession("Nem érhető el Wi-Fi hálózat") }
+        }
+        networkCallback = callback
+        try {
+            // No INTERNET/VALIDATED requirement: mobile data can stay the default route.
+            cm.requestNetwork(NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), callback, 10000)
+        } catch (e: Exception) { resetSession("Wi-Fi kérési hiba: ${e.message}") }
+    }
+
+    private fun startReading() {
+        if (demo.isChecked) {
+            values.text = "DEMO / SZIMULÁLT\nFordulatszám: 780 1/perc\nHűtőfolyadék: 88 °C\nSebesség: 0 km/h\nSTFT: +3,1%\nLTFT: +5,5%\nFojtószelep: 12%"
+            return
+        }
+        if (!elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
+        if (measuring || operation) return
+        val supported = items.filter { it in elm.supported }
+        if (supported.isEmpty()) { values.text = "VALÓDI ECU • nincs támogatott kijelzési PID"; return }
+        measuring = true
+        val token = generation.get()
+        scheduleReading(token, readingGeneration.incrementAndGet(), supported, 0)
+    }
+
+    private fun scheduleReading(token: Int, readingToken: Int, supported: List<Int>, index: Int) {
+        poll = worker.schedule({
+            if (!measuring || token != generation.get() || readingToken != readingGeneration.get()) return@schedule
+            val pid = supported[index]
+            try {
+                val line = Obd.reading(pid, Obd.bytesFor(elm.command("01%02X".format(pid)), 1, pid))
+                show(token) { if (measuring && readingToken == readingGeneration.get()) values.text = "VALÓDI ECU • friss egyedi mérés\n$line" }
+            } catch (e: Exception) {
+                show(token) { if (measuring && readingToken == readingGeneration.get()) values.text = "Nincs érvényes friss mérés • ${e.message}" }
+                if (!elm.isConnected()) { show(token) { resetSession("A TCP-kapcsolat megszakadt: ${e.message}") }; return@schedule }
+            }
+            if (measuring && token == generation.get() && readingToken == readingGeneration.get()) scheduleReading(token, readingToken, supported, (index + 1) % supported.size)
+        }, 200, TimeUnit.MILLISECONDS)
+    }
+
+    /** Serialize operations with single-PID polls, never queue an infinite read loop. */
+    private fun task(block: (Int) -> Unit) {
+        if (!elm.isConnected() || demo.isChecked) { status.text = "Előbb csatlakozz valódi módban"; return }
+        if (operation) { status.text = "Egy művelet már folyamatban van"; return }
+        operation = true
+        val token = generation.get()
+        worker.execute {
+            if (token != generation.get()) return@execute
+            try { block(token) }
+            catch (e: Exception) { show(token) {
+                if (!elm.isConnected()) resetSession("Kapcsolati hiba: ${e.message}")
+                else status.text = "Hiba: ${e.message}"
+            } }
+            finally { show(token) { operation = false } }
         }
     }
-    private fun runTask(block: () -> Unit) = worker.execute { try { block() } catch(e: Exception) { show { status.text="Hiba: ${e.message}" } } }
-    private fun show(block: () -> Unit) { runOnUiThread(block) }
-    override fun onDestroy() { measuring.set(false); elm.disconnect(); worker.shutdownNow(); super.onDestroy() }
+
+    private fun prepareClear() {
+        if (demo.isChecked || !elm.isConnected()) { status.text = "Törléshez valódi ECU-kapcsolat szükséges"; return }
+        measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+        values.text = "Mérés szünetel a törlés előkészítése miatt"
+        task { token ->
+            // Mandatory Mode 03 must decode; optional data is recorded with explicit per-query errors.
+            val stored = elm.command("03")
+            val codes = Obd.dtcs(stored, elm.canProtocol)
+            val report = JSONObject().put("schema", 1).put("source", "REAL_ECU")
+                .put("timestampUtcMillis", System.currentTimeMillis()).put("complete", false)
+                .put("canProtocol", elm.canProtocol).put("appVersion", "0.1.0")
+                .put("limitations", "RÉSZLEGES: nem teljes Freeze Frame vagy ECU-mentés; csak a felsorolt lekérdezések.")
+                .put("storedDtcRaw", stored).put("storedDtcDecoded", codes.joinToString(","))
+            val queries = JSONObject()
+            for (cmd in listOf("07", "0A", "0101", "020200", "020000")) {
+                check(token == generation.get()) { "Megszakított mentés" }
+                try {
+                    val raw = elm.command(cmd)
+                    val entry = JSONObject().put("raw", raw)
+                    try {
+                        when (cmd) {
+                            "07", "0A" -> Obd.dtcs(raw, elm.canProtocol, cmd.toInt(16))
+                            "0101" -> require(Obd.bytesFor(raw, 1, 1).size == 4)
+                            else -> {
+                                val data = Obd.bytesFor(raw, 2, cmd.substring(2,4).toInt(16))
+                                require(data.firstOrNull() == 0 && data.size == (if (cmd == "020200") 3 else 5))
+                            }
+                        }
+                        entry.put("status", "decoded")
+                    } catch (e: Exception) { entry.put("status", "unavailable_or_invalid").put("error", e.message) }
+                    queries.put(cmd, entry)
+                } catch (e: Exception) {
+                    queries.put(cmd, JSONObject().put("status", "failed").put("error", e.message))
+                    if (!elm.isConnected()) throw e
+                }
+            }
+            report.put("queries", queries)
+            val dir = File(filesDir, "diagnostic-backups").apply { check(mkdirs() || isDirectory) }
+            val file = File(dir, "partial-${System.currentTimeMillis()}-${java.util.UUID.randomUUID()}.json")
+            val content = report.toString(2)
+            FileOutputStream(file).use { output -> output.write(content.toByteArray(Charsets.UTF_8)); output.fd.sync() }
+            check(file.readText(Charsets.UTF_8) == content) { "A mentés visszaolvasása sikertelen; törlés tiltva" }
+            show(token) {
+                clearDialog = AlertDialog.Builder(this).setTitle("Részleges mentés elkészült. Törlöd a hibakódokat?")
+                    .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt DTC és a felsorolt kiegészítő lekérdezések. Nem teljes Freeze Frame-mentés; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
+                    .setNegativeButton("Mégsem", null)
+                    .setPositiveButton("Részleges mentéssel is törlöm") { _, _ ->
+                        if (token == generation.get() && !demo.isChecked) task { clearToken ->
+                            val reply = elm.command("04")
+                            check(Obd.clearAcknowledged(reply)) { "A törlés NEM igazolt: $reply. Ismételt kiolvasás szükséges." }
+                            show(clearToken) { errors.text = "VALÓDI ECU • törlés visszaigazolva; olvasd ki ismét a hibakódokat" }
+                        }
+                    }.create()
+                clearDialog?.show()
+            }
+        }
+    }
+
+    private fun show(token: Int, block: () -> Unit) { runOnUiThread { if (active && token == generation.get() && !isDestroyed) block() } }
+    override fun onStart() { super.onStart(); active = true }
+    override fun onStop() { active = false; resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
+    override fun onDestroy() { active = false; elm.close(); worker.shutdownNow(); super.onDestroy() }
 }
