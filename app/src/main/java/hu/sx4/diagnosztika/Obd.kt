@@ -26,8 +26,10 @@ object Obd {
             var line = raw.trim()
             if (line.isEmpty() || (echo.isNotEmpty() && line.replace(" ", "") == echo)) continue
             if (line.startsWith("SEARCHING...")) line = line.removePrefix("SEARCHING...").trim()
-            if (line.isEmpty() || line == "BUS INIT: OK") continue
-            require(!listOf("NO DATA", "STOPPED", "ERROR", "UNABLE", "BUS ERROR", "CAN ERROR", "BUFFER FULL", "?").any { line.contains(it) }) {
+            // K-line (ISO 9141-2 / ISO 14230-4) init status, e.g. "BUS INIT: ...OK"; "...ERROR" is rejected below.
+            if (line.isEmpty() || (line.startsWith("BUS INIT") && line.endsWith("OK"))) continue
+            require(!listOf("NO DATA", "STOPPED", "ERROR", "UNABLE", "BUS ERROR", "BUS BUSY", "CAN ERROR", "BUFFER FULL",
+                    "LV RESET", "ACT ALERT", "?").any { line.contains(it) }) {
                 "Nem értelmezhető ECU-válasz: $line"
             }
             if (line.matches(Regex("[0-9A-F]{3}"))) {
@@ -54,7 +56,8 @@ object Obd {
                 if (headerSize == 0) { result += Message("headerless", hex(line)); continue }
                 line = compact.take(headerSize) + " " + compact.drop(headerSize)
             }
-            val h = header ?: Regex("^([0-9A-F]{3}|18D[AB][0-9A-F]{4})\\s+(.+)$").matchEntire(line)!!
+            val h = header ?: Regex("^([0-9A-F]{3}|18D[AB][0-9A-F]{4})\\s+(.+)$").matchEntire(line)
+                ?: error("Nem értelmezhető ECU-válasz: $raw")
             val source = h.groupValues[1]
             val tokens = h.groupValues[2].trim().split(Regex("\\s+"))
             // Optional one-nibble CAN DLC, emitted by some ELM clones with headers on.
@@ -145,11 +148,20 @@ object Obd {
     } catch (_: Exception) { false }
 
     fun reading(pid: Int, data: List<Int>): String {
-        val length = when (pid) { 0x0C, 0x14, 0x15 -> 2; 0x05, 0x0D, 0x06, 0x07, 0x11 -> 1; else -> error("Ismeretlen mérési PID") }
+        val length = when (pid) {
+            0x0C, 0x10, 0x14, 0x15 -> 2
+            0x04, 0x05, 0x06, 0x07, 0x0B, 0x0D, 0x0E, 0x0F, 0x11 -> 1
+            else -> error("Ismeretlen mérési PID")
+        }
         require(data.size == length) { "Csonka vagy hibás mérési adat: %02X".format(pid) }
         val a = data[0]; val b = data.getOrElse(1) { 0 }
         fun f(value: Double, digits: Int = 1) = String.format(Locale.ROOT, "%.${digits}f", value)
         return when (pid) {
+            0x04 -> "Számított terhelés: ${f(a * 100.0 / 255)} %"
+            0x0B -> "Szívócső-nyomás (MAP): $a kPa"
+            0x0E -> "Gyújtási előgyújtás: ${f(a / 2.0 - 64)} °"
+            0x0F -> "Beszívott levegő: ${a - 40} °C"
+            0x10 -> "Légtömegáram (MAF): ${f((256 * a + b) / 100.0, 2)} g/s"
             0x0C -> "Fordulatszám: ${f((256 * a + b) / 4.0, 2)} 1/perc"
             0x05 -> "Hűtőfolyadék: ${a - 40} °C"
             0x0D -> "Sebesség: $a km/h"
@@ -157,5 +169,19 @@ object Obd {
             0x11 -> "Fojtószelep: ${f(a * 100.0 / 255)} %"
             else -> "O2 B1S${if (pid == 0x14) 1 else 2}: ${f(a / 200.0, 3)} V; korrekció: ${if (b == 255) "nem elérhető" else f((b - 128) * 100.0 / 128) + " %"}"
         }
+    }
+
+    /**
+     * SAE J1979 Mode 04 is intended for ignition on / engine off. Returns a Hungarian reason when the
+     * fresh RPM/speed readings do not prove a stationary, stopped engine; null when clearing may proceed.
+     */
+    fun clearBlockReason(rpmData: List<Int>?, speedData: List<Int>?, speedSupported: Boolean): String? {
+        if (rpmData == null || rpmData.size != 2) return "A fordulatszám nem ellenőrizhető; törlés tiltva"
+        val rpm = (256 * rpmData[0] + rpmData[1]) / 4.0
+        if (rpm > 0.0) return "A motor jár (${String.format(Locale.ROOT, "%.0f", rpm)} 1/perc); törlés csak álló motornál, gyújtás ráadva"
+        if (!speedSupported) return null
+        if (speedData == null || speedData.size != 1) return "A járműsebesség nem ellenőrizhető; törlés tiltva"
+        if (speedData[0] != 0) return "A jármű mozog (${speedData[0]} km/h); törlés tiltva"
+        return null
     }
 }

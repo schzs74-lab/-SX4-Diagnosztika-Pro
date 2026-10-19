@@ -29,6 +29,8 @@ class Elm327 {
         try {
             check(!cancelled()) { "Megszakított kapcsolódás" }
             s.connect(InetSocketAddress(host, port), 3500)
+            // Some Wi-Fi clones send a banner/prompt on TCP accept; left unread it shifts every reply by one.
+            drainUntilQuiet(s)
             command("ATZ", 5000)
             for (cmd in listOf("ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1")) {
                 val reply = command(cmd).replace(cmd, "").trim()
@@ -80,6 +82,15 @@ class Elm327 {
         } catch (e: Exception) {
             disconnect(); throw e
         } finally { timeout.cancel(false) }
+    }
+
+    private fun drainUntilQuiet(s: Socket, quietMs: Int = 300, maxMs: Long = 1500) {
+        val input = s.getInputStream()
+        val end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxMs)
+        s.soTimeout = quietMs
+        try {
+            while (System.nanoTime() < end) if (input.read() < 0) throw IOException("A kapcsolat megszakadt")
+        } catch (_: SocketTimeoutException) { }
     }
 
     fun disconnect() {

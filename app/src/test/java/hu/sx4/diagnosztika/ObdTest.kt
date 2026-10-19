@@ -71,4 +71,37 @@ class ObdTest {
         assertTrue(Obd.clearAcknowledged("7E8 01 44 00 00 00 00 00 00"))
         listOf("ERROR 44", "414400", "44 00", "NO DATA", "44\r7F 04 22", "44\rGARBAGE").forEach { assertFalse(it, Obd.clearAcknowledged(it)) }
     }
+    @Test fun kLineBusInitAndAdapterStatusLines() {
+        assertEquals(listOf(0xBE, 0x3E, 0xB8, 0x11), Obd.bytesFor("0100\rBUS INIT: ...OK\r41 00 BE 3E B8 11", 1, 0))
+        assertEquals(listOf(0xBE, 0x3E, 0xB8, 0x11), Obd.bytesFor("BUS INIT: OK\r41 00 BE 3E B8 11", 1, 0))
+        // Must be a regular rejection with a message, never a NullPointerException.
+        listOf("BUS INIT: ...ERROR", "LV RESET", "BUS BUSY", "ACT ALERT", "XYZ 12").forEach { raw ->
+            val e = assertThrows(Exception::class.java) { Obd.bytesFor(raw, 1, 0) }
+            assertFalse(raw, e is NullPointerException)
+            assertNotNull(raw, e.message)
+        }
+    }
+    @Test fun kLineMultiLineDtcsWithoutCount() {
+        assertEquals(listOf("P0133", "P0420", "P0171", "P0300"), Obd.dtcs("43 01 33 04 20 01 71\r43 03 00 00 00 00 00", false))
+    }
+    @Test fun additionalEnginePids() {
+        assertEquals("Számított terhelés: 100.0 %", Obd.reading(0x04, listOf(255)))
+        assertEquals("Szívócső-nyomás (MAP): 35 kPa", Obd.reading(0x0B, listOf(35)))
+        assertEquals("Gyújtási előgyújtás: -64.0 °", Obd.reading(0x0E, listOf(0)))
+        assertEquals("Gyújtási előgyújtás: 10.0 °", Obd.reading(0x0E, listOf(148)))
+        assertEquals("Beszívott levegő: 25 °C", Obd.reading(0x0F, listOf(65)))
+        assertEquals("Légtömegáram (MAF): 2.56 g/s", Obd.reading(0x10, listOf(1, 0)))
+        rejected { Obd.reading(0x10, listOf(1)) }
+        rejected { Obd.reading(0x42, listOf(1, 2)) }
+    }
+    @Test fun clearRequiresStoppedEngineAndStationaryVehicle() {
+        assertNull(Obd.clearBlockReason(listOf(0, 0), listOf(0), true))
+        assertNull(Obd.clearBlockReason(listOf(0, 0), null, false))
+        assertNotNull(Obd.clearBlockReason(listOf(0x0C, 0x30), listOf(0), true))
+        assertNotNull(Obd.clearBlockReason(listOf(0, 1), listOf(0), true))
+        assertNotNull(Obd.clearBlockReason(listOf(0, 0), listOf(3), true))
+        assertNotNull(Obd.clearBlockReason(listOf(0, 0), null, true))
+        assertNotNull(Obd.clearBlockReason(null, listOf(0), true))
+        assertNotNull(Obd.clearBlockReason(listOf(0), listOf(0), true))
+    }
 }

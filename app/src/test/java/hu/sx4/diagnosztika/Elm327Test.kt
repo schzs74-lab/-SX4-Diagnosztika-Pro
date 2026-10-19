@@ -9,7 +9,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class Elm327Test {
-    private class Adapter(private val reply: (String, Socket) -> Boolean) : AutoCloseable {
+    private class Adapter(private val greeting: String? = null, private val reply: (String, Socket) -> Boolean) : AutoCloseable {
         val server = ServerSocket(0)
         val done = CountDownLatch(1)
         @Volatile var accepted: Socket? = null
@@ -18,6 +18,7 @@ class Elm327Test {
             try {
                 server.accept().use { socket ->
                     accepted = socket
+                    greeting?.let { socket.getOutputStream().write(it.toByteArray()); socket.getOutputStream().flush() }
                     val input = socket.getInputStream()
                     val command = StringBuilder()
                     while (true) {
@@ -55,6 +56,15 @@ class Elm327Test {
                 assertFalse(elm.isConnected())
                 assertTrue(adapter.done.await(1, TimeUnit.SECONDS))
                 assertNull(adapter.failure)
+            } finally { elm.close() }
+        }
+    }
+    @Test fun bannerSentOnAcceptDoesNotShiftReplies() {
+        Adapter("\r\rELM327 v1.5\r\r>") { _, _ -> false }.use { adapter ->
+            val elm = Elm327()
+            try {
+                assertTrue(adapter.connect(elm).contains("ECU válaszolt"))
+                assertEquals(setOf(12), Obd.pids(elm.command("0100")))
             } finally { elm.close() }
         }
     }

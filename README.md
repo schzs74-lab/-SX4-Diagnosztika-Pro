@@ -1,4 +1,4 @@
-# Suzuki SX4 Diagnosztika Pro — Android prototípus 0.1.0
+# Suzuki SX4 Diagnosztika Pro — Android prototípus
 
 Céljármű: 2007 Suzuki SX4, M15A. A felhasználó visszajelzése szerint az eredeti GitHub Actions APK-fordítás és a telefonos telepítés sikerült, a DEMO és a P0420 mintakód megjelent. **Valódi ELM327 adapterrel és autóval még nincs igazolva.**
 
@@ -8,10 +8,13 @@ Céljármű: 2007 Suzuki SX4, M15A. A felhasználó visszajelzése szerint az er
 - Valódi használat: álló jármű, adapter Wi-Fi hálózatához csatlakozás az Android beállításaiban; internet nélküli kapcsolat megtartása; DEMO kikapcsolása; csatlakozás.
 - Az IPv4-cím és a port az adapter dokumentációja alapján állítandó. A `192.168.0.10:35000` csak alapérték, még nem igazolt.
 - Az alkalmazás külön Wi-Fi-socketet használ, nem a mobiladatos alapútvonalat. A mobiladat bekapcsolva maradhat. Az alkalmazás nem kapcsolódik automatikusan egy adott SSID-hez: az Androidban választott Wi-Fi-nek kell az adapteréhez tartoznia.
-- Az élőadat-kijelzés egyenként mutatja az aktuálisan befejezett PID-lekérdezést. Nem állítja, hogy több, eltérő időben olvasott érték egyidejű mérés volna. A támogatott kijelzési PID-ek: 05, 06, 07, 0C, 0D, 11, 14, 15; ezek mind az első támogatási oldalon vannak.
-- Módváltás, kapcsolatvesztés és háttérbe kerülés érvényteleníti az adatokat, bontja a kapcsolatot. Visszatérés után új kapcsolódás kell. Háttérben nincs mérés.
+- Az élőadat-kijelzés táblázatban mutatja minden PID utolsó érvényes értékét a saját korával (ms). A régi érték „ELAVULT” jelzést kap (gyors PID-eknél 4 s, lassúaknál 30 s után); hibás vagy hiányzó válasz után az adott PID „még nincs érvényes adat” állapotba kerül. Az értékek PID-enként eltérő időpontban készülnek, nem egyidejű mérések.
+- Lekérdezési terv (`LivePlan.kt`): gyors PID-ek minden körben (0C, 04, 11, 06, 14, 15, 0B, 10), lassúak körönként egy (05, 07, 0D, 0F, 0E). Csak az ECU 0100 maszkjában támogatottként jelölt PID-et kérdezi le.
+- Módváltás, kapcsolatvesztés és háttérbe kerülés érvényteleníti az adatokat, bontja a kapcsolatot. Visszatérés után új kapcsolódás kell. Háttérben nincs mérés. A képernyő elforgatása nem bontja a kapcsolatot.
 
 ## Hibakódtörlés és mentés
+
+A 04 parancs elküldése előtt az alkalmazás frissen kiolvassa a fordulatszámot (010C) és – ha támogatott – a sebességet (010D). Csak 0 1/perc (leállított motor, ráadott gyújtás) és 0 km/h esetén küld 04-et; ha ez nem ellenőrizhető, a törlés tiltott.
 
 A törlés előkészítése megállítja a mérést, frissen kiolvassa és ellenőrzi a tárolt hibakódokat. A saját belső tárhely `files/diagnostic-backups/` könyvtárába egyedi JSON-fájlt ír, lemezszinkronizálással és visszaolvasásos ellenőrzéssel. Kötelező Mode 03, kiegészítő Mode 07/0A, readiness (0101), Freeze Frame hibakód (020200) és támogatási maszk (020000) lekérdezések kerülnek bele, nyers válasszal és lekérdezésenkénti hibaállapottal. Egy nem támogatott Mode 0A például nem jelent sikeres adatmentést.
 
@@ -39,4 +42,17 @@ A workflow `main` pushra, `main` célú pull requestre és kézzel futtatható. 
 
 A JVM-tesztek a dekódolást és helyi TCP-szimulátorral a parancshatáridőt, töredezett választ, kapcsolatvesztést, azonnali bontást, inicializálási hibát és válaszhosszkorlátot ellenőrzik. Android Wi-Fi-útválasztást vagy valódi ECU-kompatibilitást nem igazolnak.
 
-Az eredeti forrás auditja és a fizikai ellenőrzési terv: [docs/AUDIT.md](docs/AUDIT.md).
+## Verziószám és APK-aláírás
+
+- A verzió alapja a `version.properties` (`VERSION_NAME`, kézzel léptetendő). A `versionCode` CI-ben a GitHub Actions futásszáma, helyben a commitok száma; a megjelenített `versionName` pl. `0.2.0-build57`. Az alkalmazás fejléce mutatja a versionName-et, versionCode-ot, buildszámot, commitazonosítót és build-típust; a törlés előtti JSON-mentés is ezeket rögzíti.
+- **Frissítés adatvesztés nélkül csak azonos aláírókulccsal lehetséges.** Titkok nélkül a CI minden futáskor ideiglenes debug-kulcsot használ, így az új APK nem telepíthető a régire. Egyszeri beállítás (a kulcsot és a jelszavakat biztonságos helyen meg kell őrizni, elvesztésük után csak eltávolítással lehet frissíteni):
+
+```sh
+keytool -genkeypair -v -keystore sx4-release.jks -alias sx4 -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 sx4-release.jks > sx4-release.jks.b64
+```
+
+  GitHub → Settings → Secrets and variables → Actions: `SX4_KEYSTORE_BASE64` (a .b64 fájl tartalma), `SX4_KEYSTORE_PASSWORD`, `SX4_KEY_ALIAS` (`sx4`), `SX4_KEY_PASSWORD`. Ezután a debug és a release APK is ezzel a kulccsal készül, az artifact neve tartalmazza a verziót.
+- Az első, már állandó kulccsal aláírt APK telepítése előtt **egyszer** el kell távolítani a régi (ideiglenes kulcsú) alkalmazást; ez törli a belső mentéseket, ezért előtte érdemes azokat kimenteni (`adb shell run-as hu.sx4.diagnosztika ...`). Ettől kezdve minden új build frissítésként, adatmegőrzéssel települ.
+
+Részletes audit és fejlesztési terv: [docs/CLAUDE_AUDIT.md](docs/CLAUDE_AUDIT.md). Az eredeti forrás korábbi auditja és a fizikai ellenőrzési terv: [docs/AUDIT.md](docs/AUDIT.md).
