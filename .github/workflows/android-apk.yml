@@ -23,6 +23,9 @@ jobs:
           gradle-version: '8.9'
       - name: Android SDK beállítása
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Android 35 SDK telepítése
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Debug APK építése
