@@ -41,7 +41,15 @@ jobs:
       - name: Állandó aláírókulcs előkészítése (ha a titkok be vannak állítva)
         if: env.SX4_KEYSTORE_BASE64 != ''
         run: |
-          echo "$SX4_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/sx4-release.jks"
+          # Tolerate common copy-paste formats: wrapped lines, Windows CRLF, trailing spaces, certutil headers.
+          if ! printf '%s' "$SX4_KEYSTORE_BASE64" | sed '/^-----/d' | tr -d ' \t\r\n' | base64 --decode > "$RUNNER_TEMP/sx4-release.jks"; then
+            echo "::error::Az SX4_KEYSTORE_BASE64 titok nem érvényes base64. A .jks fájl 'base64 -w0' kimenetét másold be, más szöveg nélkül."
+            exit 1
+          fi
+          if ! keytool -list -keystore "$RUNNER_TEMP/sx4-release.jks" -storepass "$SX4_KEYSTORE_PASSWORD" -alias "$SX4_KEY_ALIAS" > /dev/null; then
+            echo "::error::A kulcstár nem nyitható meg: ellenőrizd az SX4_KEYSTORE_PASSWORD és SX4_KEY_ALIAS titkot, illetve hogy a base64 a teljes .jks fájlból készült-e."
+            exit 1
+          fi
           echo "SX4_KEYSTORE_FILE=$RUNNER_TEMP/sx4-release.jks" >> "$GITHUB_ENV"
       - name: Figyelmeztetés aláírókulcs nélkül
         if: env.SX4_KEYSTORE_BASE64 == ''
