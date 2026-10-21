@@ -4,7 +4,7 @@ on:
     branches: [main]
   workflow_dispatch:
   push:
-    branches: [main, codex/sx4-side-by-side-test]
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -79,8 +79,8 @@ jobs:
           "$tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/sx4-badging.txt"
           grep -E "^(package:|application-label:|launchable-activity:)" "$RUNNER_TEMP/sx4-badging.txt"
           grep -q "^package: name='hu.sx4.diagnosztika.teszt'" "$RUNNER_TEMP/sx4-badging.txt"
-          grep -q "^application-label:'SX4 Diagnosztika Teszt'" "$RUNNER_TEMP/sx4-badging.txt"
           "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/sx4-manifest.txt"
+          grep -q 'android:label.*"SX4 Diagnosztika Teszt"' "$RUNNER_TEMP/sx4-manifest.txt"
           grep -q '"hu.sx4.diagnosztika.MainActivity"' "$RUNNER_TEMP/sx4-manifest.txt"
           "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/sx4-signature.txt"
           grep -qi "certificate SHA-256 digest: 75b9ae43feb7bb137062adbe60f60e34544e27983e5e2e1d7e3f342cc8f81c9f" "$RUNNER_TEMP/sx4-signature.txt"
