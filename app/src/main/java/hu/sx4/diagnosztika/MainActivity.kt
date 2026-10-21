@@ -56,6 +56,16 @@ class MainActivity : Activity() {
         fun title(s: String) = TextView(this).apply { text = s; textSize = 22f; setTextColor(Color.rgb(20,55,72)); setPadding(0,18,0,12); root.addView(this) }
         fun button(s: String, action: () -> Unit) = Button(this).apply { text = s; setOnClickListener { action() }; root.addView(this) }
         fun field(value: String, hint: String) = EditText(this).apply { setText(value); this.hint = hint; setSingleLine(true); root.addView(this) }
+        // Packaged photo: no network connection is needed on the opening screen.
+        root.addView(ImageView(this).apply {
+            setImageResource(R.drawable.sx4_header)
+            contentDescription = "Piros, első generációs Suzuki SX4"
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            maxHeight = (220 * resources.displayMetrics.density).toInt()
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        })
         title("SX4 Diagnosztika Teszt")
         TextView(this).apply {
             text = "Külön telepített tesztváltozat\nSuzuki SX4 2007 • M15A • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
