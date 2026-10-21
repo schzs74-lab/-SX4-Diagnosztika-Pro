@@ -1,0 +1,84 @@
+name: Build5 signing verification
+on:
+  push:
+    branches: [codex/check-build5-signing]
+    paths: [.github/workflows/check-build5-signing.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download original build5 APK
+        uses: actions/download-artifact@v4
+        with:
+          name: SX4-Diagnosztika-Pro-APK-build5
+          run-id: 39325189579
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/sx4-build5-original
+      - name: Compare signing certificates without exposing secrets
+        env:
+          SX4_KEYSTORE_BASE64: ${{ secrets.SX4_KEYSTORE_BASE64 }}
+          SX4_KEYSTORE_PASSWORD: ${{ secrets.SX4_KEYSTORE_PASSWORD }}
+          SX4_KEY_ALIAS: ${{ secrets.SX4_KEY_ALIAS }}
+        shell: python
+        run: |
+          import base64, hashlib, os, pathlib, re, subprocess, tempfile
+          def report(message):
+              print(message, flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(message + "\n\n")
+          encoded = os.environ.get("SX4_KEYSTORE_BASE64", "")
+          if not encoded:
+              report("RESULT: MISSING_KEYSTORE_SECRET")
+              raise SystemExit(1)
+          clean = "".join(line for line in encoded.splitlines() if not line.startswith("-----"))
+          clean = "".join(clean.split()).replace("_", "/").replace("-", "+")
+          try:
+              data = base64.b64decode(clean, validate=True)
+          except Exception:
+              report("RESULT: INVALID_KEYSTORE_ENCODING")
+              raise SystemExit(1)
+          uploaded_hash = "509f1f085e7f4996689606b0a85ef5fc594f6c4b6d51460d8d079b0dd63ca10f"
+          report("Uploaded keystore equals GitHub keystore: " + str(hashlib.sha256(data).hexdigest() == uploaded_hash))
+          with tempfile.TemporaryDirectory(prefix="sx4-cert-check-", dir=os.environ["RUNNER_TEMP"]) as tmp:
+              keyfile = pathlib.Path(tmp) / "keystore"
+              keyfile.write_bytes(data)
+              keyfile.chmod(0o600)
+              alias = os.environ.get("SX4_KEY_ALIAS", "")
+              if not alias:
+                  report("RESULT: MISSING_ALIAS_SECRET")
+                  raise SystemExit(1)
+              exported = subprocess.run(
+                  ["keytool", "-exportcert", "-keystore", str(keyfile),
+                   "-storepass:env", "SX4_KEYSTORE_PASSWORD", "-alias", alias],
+                  capture_output=True)
+              if exported.returncode:
+                  report("RESULT: KEYSTORE_PASSWORD_OR_ALIAS_CHECK_FAILED")
+                  raise SystemExit(1)
+              current = hashlib.sha256(exported.stdout).hexdigest()
+              report("Current key public certificate SHA256: " + current)
+              sdk = pathlib.Path(os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk"))
+              candidates = sorted((sdk / "build-tools").glob("*/apksigner"))
+              if not candidates:
+                  report("RESULT: APKSIGNER_UNAVAILABLE")
+                  raise SystemExit(1)
+              apks = list((pathlib.Path(os.environ["RUNNER_TEMP"]) / "sx4-build5-original").rglob("*.apk"))
+              if len(apks) != 1:
+                  report("RESULT: EXPECTED_ONE_ORIGINAL_APK")
+                  raise SystemExit(1)
+              verified = subprocess.run([str(candidates[-1]), "verify", "--print-certs", str(apks[0])],
+                                        capture_output=True, text=True)
+              if verified.returncode:
+                  report("RESULT: ORIGINAL_APK_SIGNATURE_VERIFICATION_FAILED")
+                  raise SystemExit(1)
+              digests = re.findall(r"Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]+)", verified.stdout)
+              if not digests:
+                  report("RESULT: ORIGINAL_SIGNER_NOT_FOUND")
+                  raise SystemExit(1)
+              for digest in digests:
+                  report("Build5 public certificate SHA256: " + digest.lower())
+              report("RESULT: " + ("MATCH" if {x.lower() for x in digests} == {current} else "DIFFERENT_KEYS"))
