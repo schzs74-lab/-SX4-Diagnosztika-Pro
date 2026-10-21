@@ -59,7 +59,7 @@ class MainActivity : Activity() {
         // Packaged photo: no network connection is needed on the opening screen.
         root.addView(ImageView(this).apply {
             setImageResource(R.drawable.sx4_header)
-            contentDescription = "Piros, első generációs Suzuki SX4"
+            contentDescription = "Fekete, első generációs Suzuki SX4"
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
             maxHeight = (220 * resources.displayMetrics.density).toInt()
