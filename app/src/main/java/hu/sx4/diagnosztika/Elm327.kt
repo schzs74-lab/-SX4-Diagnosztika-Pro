@@ -59,7 +59,7 @@ class Elm327 {
 
     fun command(cmd: String, timeoutMs: Int = 3500): String = synchronized(ioLock) {
         // Only standard diagnostic reads and the explicitly confirmed Mode 04 are available.
-        require(cmd in setOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1", "ATI", "ATDPN", "ATRV", "03", "04", "07", "0A") ||
+        require(cmd in setOf("ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0", "ATCAF1", "ATI", "ATDPN", "ATRV", "03", "04", "07", "0A", "0900", "0902", "0904", "0906", "090A") ||
             cmd.matches(Regex("01[0-9A-F]{2}|02[0-9A-F]{2}00"))) { "Nem engedélyezett parancs" }
         require(timeoutMs > 0)
         val s = socket ?: error("Nincs kapcsolat")

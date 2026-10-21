@@ -34,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var values: TextView
     private lateinit var errors: TextView
     private lateinit var statusReport: TextView
+    private lateinit var identity: TextView
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var demo: Switch
@@ -68,7 +69,7 @@ class MainActivity : Activity() {
         })
         title("SX4 Diagnosztika Teszt")
         TextView(this).apply {
-            text = "Külön telepített tesztváltozat\nSuzuki SX4 2007 • M15A • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
+            text = "Külön telepített tesztváltozat\nMegadott profil: Suzuki SX4 2007 • 1.5 benzin • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
                 "Build ${BuildConfig.BUILD_NUMBER} • commit ${BuildConfig.GIT_SHA} • ${BuildConfig.BUILD_TYPE}"
             root.addView(this)
         }
@@ -78,6 +79,13 @@ class MainActivity : Activity() {
         demo = Switch(this).apply { text = "DEMO mód – szimulált adatok"; isChecked = true; root.addView(this) }
         button("Csatlakozás az adapterhez") { connectWifi() }
         button("Kapcsolat bontása") { resetSession("Kapcsolat bontva • a korábbi adatok érvénytelenek") }
+        title("Vezérlőazonosítás")
+        identity = TextView(this).apply { text = "Azonosítók még nincsenek kiolvasva"; textSize = 16f; root.addView(this) }
+        button("Adapter és ECU azonosítóinak olvasása") { readIdentity() }
+        TextView(this).apply {
+            text = "Szabványos OBD-azonosítók. Gyártói szervizfunkciók és paraméterírás még nincs beépítve."
+            root.addView(this)
+        }
         title("Élő motoradatok")
         values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
         button("Élő adatok indítása") { startReading() }
@@ -119,6 +127,26 @@ class MainActivity : Activity() {
         values.text = "Nincs érvényes mérés"
         errors.text = "Nincs érvényes hibakód-kiolvasás"
         statusReport.text = "Nincs érvényes állapot-kiolvasás"
+        identity.text = "Nincs érvényes azonosító-kiolvasás"
+    }
+
+    private fun readIdentity() {
+        if (demo.isChecked) {
+            identity.text = "DEMO mód • nincs valódi adapter- vagy ECU-azonosító. Kapcsold ki a DEMO módot, és csatlakozz az adapterhez."
+            return
+        }
+        if (!elm.isConnected()) { status.text = "Azonosításhoz előbb csatlakozz az adapterhez"; return }
+        if (operation) { status.text = "Egy művelet már folyamatban van"; return }
+        if (measuring) {
+            measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+            values.text = "Mérés szünetel a vezérlőazonosítás miatt"
+        }
+        identity.text = "Azonosítók kiolvasása folyamatban… Ez több másodpercig tarthat."
+        task { token ->
+            val lines = EcuIdentity({ elm.command(it, 8000) }, elm.canProtocol,
+                { token == generation.get() && elm.isConnected() }).report()
+            show(token) { identity.text = "VALÓDI KAPCSOLAT • szabványos azonosítók\n" + lines.joinToString("\n") }
+        }
     }
 
     private fun readStatus() {

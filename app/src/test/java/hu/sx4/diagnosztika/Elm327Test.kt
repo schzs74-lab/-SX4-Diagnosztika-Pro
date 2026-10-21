@@ -173,7 +173,22 @@ class Elm327Test {
     }
     @Test fun writeCommandsAreRejected() {
         val elm = Elm327()
-        try { listOf("ATSH7E0", "2E123400", "0902", "04\r04").forEach { cmd -> assertThrows(IllegalArgumentException::class.java) { elm.command(cmd) } } }
+        try { listOf("ATSH7E0", "2E123400", "0908", "090B", "0902\r04", "04\r04").forEach { cmd -> assertThrows(IllegalArgumentException::class.java) { elm.command(cmd) } } }
         finally { elm.close() }
+    }
+
+    @Test fun onlyExplicitIdentityReadCommandsReachAdapter() {
+        val seen = mutableListOf<String>()
+        Adapter { cmd, _ -> seen += cmd; false }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                val reads = listOf("0900", "0902", "0904", "0906", "090A")
+                reads.forEach { assertEquals("OK", elm.command(it).trim()) }
+                assertEquals(reads, seen.filter { it.startsWith("09") })
+                assertThrows(IllegalArgumentException::class.java) { elm.command("2E123400") }
+                assertFalse(seen.contains("2E123400"))
+            } finally { elm.close() }
+        }
     }
 }
