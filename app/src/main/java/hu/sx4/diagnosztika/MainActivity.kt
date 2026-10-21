@@ -56,9 +56,9 @@ class MainActivity : Activity() {
         fun title(s: String) = TextView(this).apply { text = s; textSize = 22f; setTextColor(Color.rgb(20,55,72)); setPadding(0,18,0,12); root.addView(this) }
         fun button(s: String, action: () -> Unit) = Button(this).apply { text = s; setOnClickListener { action() }; root.addView(this) }
         fun field(value: String, hint: String) = EditText(this).apply { setText(value); this.hint = hint; setSingleLine(true); root.addView(this) }
-        title("SX4 Diagnosztika Pro")
+        title("SX4 Diagnosztika Teszt")
         TextView(this).apply {
-            text = "Suzuki SX4 2007 • M15A • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
+            text = "Külön telepített tesztváltozat\nSuzuki SX4 2007 • M15A • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
                 "Build ${BuildConfig.BUILD_NUMBER} • commit ${BuildConfig.GIT_SHA} • ${BuildConfig.BUILD_TYPE}"
             root.addView(this)
         }
