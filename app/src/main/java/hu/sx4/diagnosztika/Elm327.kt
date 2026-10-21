@@ -42,7 +42,7 @@ class Elm327 {
     }
 
     /** The only Mode 04 path; every caller receives the same freshness and standstill checks. */
-    fun clearDtcs(permit: ClearPermit, current: () -> Boolean = { true }) = synchronized(ioLock) {
+    fun clearDtcs(permit: ClearPermit, onDispatch: () -> Unit = {}, current: () -> Boolean = { true }) = synchronized(ioLock) {
         fun validate(codes: Set<String>? = null) {
             check(current() && isConnected()) { "Megszakított törlés" }
             clearAvailabilityReason()?.let { error(it) }
@@ -59,6 +59,9 @@ class Elm327 {
         val speed = if (speedSupported) Obd.bytesFor(command("010D"), 1, 0x0D) else null
         Obd.clearBlockReason(rpm, speed, speedSupported)?.let { error("$it. A 04 parancs NEM lett elküldve.") }
         validate()
+        onDispatch()
+        validate()
+        permit.markDispatched()
         val response = try { exchange("04", 3500) } catch (e: Exception) { throw ClearOutcomeUnknown(e) }
         if (!EcuChannel.clearAcknowledged(response, protocolNumber, permit.source)) throw ClearOutcomeUnknown()
     }
@@ -86,7 +89,7 @@ class Elm327 {
             val protocolText = command("ATDPN").trim().uppercase(Locale.ROOT)
             val protocol = (if (protocolText.length == 2) protocolText.removePrefix("A") else protocolText).toIntOrNull(16)
                 ?: error("Ismeretlen OBD-protokoll")
-            check(protocol in 3..9) { "Ezen a protokollon a forráscím szerinti OBD-kezelés még nem támogatott" }
+            check(protocol in 1..9) { "Ezen a protokollon a forráscím szerinti OBD-kezelés még nem támogatott" }
             protocolNumber = protocol
             canProtocol = protocol in 6..9
             val first = EcuChannel.supportBySource(firstRaw, protocol)

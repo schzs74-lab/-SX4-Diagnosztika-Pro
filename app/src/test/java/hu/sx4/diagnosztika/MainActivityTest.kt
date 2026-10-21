@@ -107,4 +107,18 @@ class MainActivityTest {
             assertFalse((get(activity, "elm") as Elm327).isConnected())
         } finally { controller.pause().stop().destroy() }
     }
+    @Test fun pendingClearWarningSurvivesActivityRecreation() {
+        val first = Robolectric.buildActivity(MainActivity::class.java).setup()
+        first.get().getSharedPreferences("diagnostic-state", android.content.Context.MODE_PRIVATE)
+            .edit().putBoolean("clearPending", true).commit()
+        first.pause().stop().destroy()
+        val second = Robolectric.buildActivity(MainActivity::class.java).setup()
+        try {
+            assertTrue(text(second.get(), "status").contains("BIZONYTALAN"))
+        } finally {
+            second.get().getSharedPreferences("diagnostic-state", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+            second.pause().stop().destroy()
+        }
+    }
+
 }

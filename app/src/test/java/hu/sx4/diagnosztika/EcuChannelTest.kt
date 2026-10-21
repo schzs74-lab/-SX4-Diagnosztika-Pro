@@ -15,9 +15,12 @@ class EcuChannelTest {
 
     @Test fun legacyPublishedTwoEcuExampleRetainsSourceAddresses() {
         val raw = "48 6B 10 41 00 BE 3E B8 11 FA\r48 6B 18 41 00 80 10 80 00 C0"
-        val masks = EcuChannel.supportBySource(raw, 3)
+        val masks = EcuChannel.supportBySource(raw, 2)
         assertEquals(setOf("10", "18"), masks.keys)
         assertTrue(5 in masks.getValue("10")); assertFalse(5 in masks.getValue("18"))
+        val iso9141 = raw.replace("11 FA", "11 C9").replace("00 C0", "00 1C")
+        assertEquals(masks, EcuChannel.supportBySource(iso9141, 3))
+        assertThrows(IllegalArgumentException::class.java) { EcuChannel.supportBySource(raw, 3) }
     }
 
     @Test fun kwpShortAndExplicitLengthsAreChecked() {

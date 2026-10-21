@@ -55,6 +55,10 @@ class MainActivity : Activity() {
     private val latest = LinkedHashMap<Int, Pair<String, Long>>()
     /** Moving average of one poll (delay + request), the basis of each PID's stale limit. */
     @Volatile private var avgPollMs = 500L
+    private val clearState by lazy { getSharedPreferences("diagnostic-state", Context.MODE_PRIVATE) }
+    private fun clearWarning(): String = "A korábbi törlés eredménye BIZONYTALAN. Csatlakozz újra, és olvasd ki a hibakódokat."
+    private fun sessionStatus(message: String): String =
+        if (clearState.getBoolean("clearPending", false) && !message.contains("BIZONYTALAN")) clearWarning() + "\n" + message else message
     private val cm by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,7 +119,11 @@ class MainActivity : Activity() {
                 task(onAccepted = { errors.text = "VALÓDI ECU • hibakód-kiolvasás folyamatban…" },
                     onFailure = { errors.text = "A hibakód-kiolvasás sikertelen: $it" }) { token ->
                 val codes = Obd.dtcs(elm.command("03"), elm.canProtocol)
-                show(token) { errors.text = "VALÓDI ECU • tárolt hibakódok\n" + codes.ifEmpty { listOf("Nincs tárolt hibakód a sikeresen dekódolt válaszban") }.joinToString("\n") }
+                show(token) {
+                    clearState.edit().remove("clearPending").apply()
+                    status.text = "VALÓDI • ECU: ${elm.selectedSource} • a hibakódok frissen kiolvasva"
+                    errors.text = "VALÓDI ECU • tárolt hibakódok\n" + codes.ifEmpty { listOf("Nincs tárolt hibakód a sikeresen dekódolt válaszban") }.joinToString("\n")
+                }
                 }
             }
         }
@@ -138,7 +146,7 @@ class MainActivity : Activity() {
         elm.disconnect()
         networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: IllegalArgumentException) {} }
         networkCallback = null
-        status.text = message
+        status.text = sessionStatus(message)
         values.text = "Nincs érvényes mérés"
         errors.text = "Nincs érvényes hibakód-kiolvasás"
         statusReport.text = "Nincs érvényes állapot-kiolvasás"
@@ -187,7 +195,7 @@ class MainActivity : Activity() {
                 errors.text = "Új vezérlő • nincs érvényes hibakód-kiolvasás"
                 statusReport.text = "Új vezérlő • nincs érvényes állapot-kiolvasás"
                 identity.text = "Új vezérlő • nincs érvényes azonosító-kiolvasás"
-                status.text = "VALÓDI • kiválasztott ECU: ${sources[index]}. A cím önmagában nem azonosítja a vezérlő feladatát."
+                status.text = sessionStatus("VALÓDI • kiválasztott ECU: ${sources[index]}. A cím önmagában nem azonosítja a vezérlő feladatát.")
             }.setNegativeButton("Mégsem", null).create()
         ecuDialog?.show()
     }
@@ -221,7 +229,7 @@ class MainActivity : Activity() {
                         val id = elm.connect(ip, p, { network.socketFactory.createSocket() }, { token != generation.get() })
                         show(token) {
                             connecting = false
-                            status.text = "VALÓDI • $id • kiválasztva: ${elm.selectedSource ?: "nincs, válassz vezérlőt"}"
+                            status.text = sessionStatus("VALÓDI • $id • kiválasztva: ${elm.selectedSource ?: "nincs, válassz vezérlőt"}")
                             if (elm.selectedSource == null) chooseEcu()
                         }
                     } catch (e: Exception) {
@@ -322,7 +330,7 @@ class MainActivity : Activity() {
         if (demo.isChecked || !elm.isConnected()) { status.text = "Törléshez valódi ECU-kapcsolat szükséges"; return }
         if (operation) { status.text = "Egy művelet már folyamatban van"; return }
         elm.clearAvailabilityReason()?.let { status.text = it; return }
-        task { token ->
+        task(onAccepted = { status.text = "Törlés előkészítése • részleges mentés folyamatban…" }) { token ->
             // Mandatory Mode 03 must decode; optional data is recorded with explicit per-query errors.
             val stored = elm.command("03")
             val codes = Obd.dtcs(stored, elm.canProtocol)
@@ -373,13 +381,27 @@ class MainActivity : Activity() {
             show(token) {
                 val remainingMs = (ClearPermit.LIFETIME_NANOS - (System.nanoTime() - permit.createdAtNanos)) / 1_000_000
                 if (remainingMs <= 0) { status.text = "A mentés lejárt; indítsd újra a törlés előkészítését"; return@show }
+                status.text = "Részleges mentés elkészült • megerősítésre vár"
                 clearDialog = AlertDialog.Builder(this).setTitle("Részleges mentés elkészült. Törlöd a hibakódokat?")
                     .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt és függő DTC, readiness, a 0. Freeze Frame összes támogatott PID-je és járműállapot. Más ECU-k és gyártóspecifikus adatok nincsenek benne; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA megerősítés legfeljebb 2 percig érvényes a hibakódok mentésétől számítva. Megváltozott hibakódlista esetén új mentés szükséges. A Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél, ráadott gyújtással és LEÁLLÍTOTT motorral: a 04 elküldése előtt az alkalmazás frissen ellenőrzi, hogy a fordulatszám és a sebesség 0. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
                     .setNegativeButton("Mégsem", null)
                     .setPositiveButton("Részleges mentéssel is törlöm") { _, _ ->
-                        if (token == generation.get() && !demo.isChecked) task { clearToken ->
-                            elm.clearDtcs(permit) { clearToken == generation.get() }
-                            show(clearToken) { errors.text = "VALÓDI ECU • törlés visszaigazolva; olvasd ki ismét a hibakódokat" }
+                        if (token == generation.get() && !demo.isChecked) task(onAccepted = {
+                            status.text = "Törlési előfeltételek friss ellenőrzése…"
+                        }) { clearToken ->
+                            try {
+                                elm.clearDtcs(permit, onDispatch = {
+                                    check(clearState.edit().putBoolean("clearPending", true).commit()) { "A törlési kísérlet állapota nem menthető; törlés tiltva" }
+                                }) { clearToken == generation.get() }
+                                clearState.edit().remove("clearPending").apply()
+                            } catch (e: Exception) {
+                                if (e !is ClearOutcomeUnknown) clearState.edit().remove("clearPending").apply()
+                                throw e
+                            }
+                            show(clearToken) {
+                                status.text = "VALÓDI • a törlés visszaigazolva"
+                                errors.text = "VALÓDI ECU • törlés visszaigazolva; olvasd ki ismét a hibakódokat"
+                            }
                         }
                     }.create()
                 val shownDialog = clearDialog
@@ -397,7 +419,10 @@ class MainActivity : Activity() {
     }
 
     private fun show(token: Int, block: () -> Unit) { runOnUiThread { if (active && token == generation.get() && !isDestroyed) block() } }
-    override fun onStart() { super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick) }
+    override fun onStart() {
+        super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick)
+        if (clearState.getBoolean("clearPending", false)) status.text = clearWarning()
+    }
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdownNow(); super.onDestroy() }
 }

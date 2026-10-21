@@ -223,7 +223,7 @@ class Elm327Test {
         Adapter { cmd, socket ->
             when (cmd) {
                 "ATDPN" -> reply(socket, "A3")
-                "0100" -> reply(socket, "48 6B 10 41 00 BE 3E B8 11 FA\r48 6B 18 41 00 80 10 80 00 C0")
+                "0100" -> reply(socket, "48 6B 10 41 00 BE 3E B8 11 C9\r48 6B 18 41 00 80 10 80 00 1C")
                 "0120" -> reply(socket, "NO DATA")
                 "0105" -> reply(socket, "48 6B 10 41 05 80 89\r48 6B 18 41 05 90 A1")
                 else -> false
@@ -264,6 +264,8 @@ class Elm327Test {
                 val permit = elm.prepareClearPermit(elm.command("03"))
                 elm.clearDtcs(permit)
                 assertEquals(listOf("0100", "03", "010C", "010D", "04"), seen.takeLast(5))
+                assertThrows(IllegalStateException::class.java) { elm.clearDtcs(permit) }
+                assertEquals(1, seen.count { it == "04" })
                 assertThrows(IllegalArgumentException::class.java) { elm.command("04") }
             } finally { elm.close() }
         }

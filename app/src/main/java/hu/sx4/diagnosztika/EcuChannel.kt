@@ -6,14 +6,15 @@ object EcuChannel {
         if (protocol in 6..9) return Obd.messages(raw, command).also { messages ->
             require(messages.all { it.can }) { "Az adapter nem küld értelmezhető CAN-forráscímeket ATH1 mellett" }
         }
-        require(protocol in 3..5) { "A forráscím szerinti kezelés ezen a protokollon még nem támogatott" }
+        require(protocol in 1..5) { "A forráscím szerinti kezelés ezen a protokollon még nem támogatott" }
         // Reuse echo/status/error validation and hex parsing, then decode the legacy envelope.
         return Obd.messages(raw, command).map { message ->
             require(message.source == "headerless") { "Váratlan K-line keret" }
             val bytes = message.data
-            require(bytes.size >= 5 && (bytes.dropLast(1).sum() and 255) == bytes.last()) { "Csonka vagy hibás K-line ellenőrzőösszeg" }
-            val data = if (protocol == 3) {
-                require(bytes.take(2) == listOf(0x48, 0x6B)) { "Ismeretlen ISO 9141 fejléc" }
+            val checksum = if (protocol in 1..2) j1850Crc(bytes.dropLast(1)) else bytes.dropLast(1).sum() and 255
+            require(bytes.size >= 5 && checksum == bytes.last()) { "Csonka vagy hibás nem-CAN ellenőrzőösszeg" }
+            val data = if (protocol in 1..3) {
+                if (protocol == 3) require(bytes.take(2) == listOf(0x48, 0x6B)) { "Ismeretlen ISO 9141 fejléc" }
                 bytes.drop(3).dropLast(1)
             } else {
                 require(bytes[0] and 0x80 != 0 && bytes[1] == 0xF1) { "Ismeretlen KWP címzés" }
@@ -50,4 +51,13 @@ object EcuChannel {
     } catch (_: Exception) { false }
 
     private fun hex(bytes: List<Int>) = bytes.joinToString(" ") { "%02X".format(it) }
+
+    private fun j1850Crc(bytes: List<Int>): Int {
+        var crc = 0xFF
+        for (byte in bytes) {
+            crc = crc xor byte
+            repeat(8) { crc = if (crc and 0x80 != 0) ((crc shl 1) xor 0x1D) and 0xFF else (crc shl 1) and 0xFF }
+        }
+        return crc xor 0xFF
+    }
 }
