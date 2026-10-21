@@ -82,6 +82,20 @@ class EcuIdentityTest {
         assertTrue(lines.any { it.contains("CVN") && it.contains("hibás válasz") })
     }
 
+    @Test fun nullPaddedAcronymIsDecodedSeparatelyFromEcuTextName() {
+        val name = ascii("ECM") + listOf(0, 45) + ascii("EngineControl") + listOf(0, 0)
+        assertEquals(20, name.size)
+        assertEquals(listOf("ECM — EngineControl"), EcuIdentity.decode(can(10, name), 10, true))
+        assertEquals(listOf("ECM — EngineControl"), EcuIdentity.decode(legacy(10, name), 10, false))
+        assertThrows(IllegalArgumentException::class.java) { EcuIdentity.decode(can(10, listOf(69, 0, 67, 77) + name.drop(4)), 10, true) }
+    }
+
+    @Test fun legacyMaskRecordIndexIsAcceptedOnlyInItsExactForm() {
+        assertEquals(setOf(2,4,6,10), EcuIdentity.supportMask("49 00 01 54 40 00 00", false))
+        assertThrows(IllegalArgumentException::class.java) { EcuIdentity.supportMask("49 00 02 54 40 00 00", false) }
+        assertThrows(IllegalArgumentException::class.java) { EcuIdentity.supportMask("49 00 01 54 40 00 00", true) }
+    }
+
     @Test fun transportLossAndSessionCancellationStopFurtherCommands() {
         var live = true
         val commands = mutableListOf<String>()

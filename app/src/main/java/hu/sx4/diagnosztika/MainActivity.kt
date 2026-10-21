@@ -9,6 +9,9 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.widget.*
 import org.json.JSONObject
 import java.io.File
@@ -30,6 +33,16 @@ class MainActivity : Activity() {
     private var connecting = false
     private var operation = false
     private var clearDialog: AlertDialog? = null
+    private var ecuDialog: AlertDialog? = null
+    private val ui = Handler(Looper.getMainLooper())
+    private var activeSequence: List<Int> = emptyList()
+    private val ageTick = object : Runnable {
+        override fun run() {
+            if (!active) return
+            if (measuring && activeSequence.isNotEmpty()) renderLatest(activeSequence)
+            ui.postDelayed(this, 500)
+        }
+    }
     private lateinit var status: TextView
     private lateinit var values: TextView
     private lateinit var errors: TextView
@@ -79,6 +92,7 @@ class MainActivity : Activity() {
         demo = Switch(this).apply { text = "DEMO mód – szimulált adatok"; isChecked = true; root.addView(this) }
         button("Csatlakozás az adapterhez") { connectWifi() }
         button("Kapcsolat bontása") { resetSession("Kapcsolat bontva • a korábbi adatok érvénytelenek") }
+        button("Vezérlő kiválasztása") { chooseEcu() }
         title("Vezérlőazonosítás")
         identity = TextView(this).apply { text = "Azonosítók még nincsenek kiolvasva"; textSize = 16f; root.addView(this) }
         button("Adapter és ECU azonosítóinak olvasása") { readIdentity() }
@@ -98,8 +112,8 @@ class MainActivity : Activity() {
         button("Tárolt hibakódok olvasása") {
             if (demo.isChecked) errors.text = "DEMO / SZIMULÁLT\nP0420 – Katalizátor hatásfoka a küszöb alatt (1. hengersor)"
             else {
-                errors.text = "VALÓDI ECU • hibakód-kiolvasás folyamatban…"
-                task { token ->
+                task(onAccepted = { errors.text = "VALÓDI ECU • hibakód-kiolvasás folyamatban…" },
+                    onFailure = { errors.text = "A hibakód-kiolvasás sikertelen: $it" }) { token ->
                 val codes = Obd.dtcs(elm.command("03"), elm.canProtocol)
                 show(token) { errors.text = "VALÓDI ECU • tárolt hibakódok\n" + codes.ifEmpty { listOf("Nincs tárolt hibakód a sikeresen dekódolt válaszban") }.joinToString("\n") }
                 }
@@ -120,6 +134,7 @@ class MainActivity : Activity() {
         generation.incrementAndGet(); measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
         connecting = false; operation = false
         clearDialog?.dismiss(); clearDialog = null
+        ecuDialog?.dismiss(); ecuDialog = null
         elm.disconnect()
         networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: IllegalArgumentException) {} }
         networkCallback = null
@@ -135,17 +150,11 @@ class MainActivity : Activity() {
             identity.text = "DEMO mód • nincs valódi adapter- vagy ECU-azonosító. Kapcsold ki a DEMO módot, és csatlakozz az adapterhez."
             return
         }
-        if (!elm.isConnected()) { status.text = "Azonosításhoz előbb csatlakozz az adapterhez"; return }
-        if (operation) { status.text = "Egy művelet már folyamatban van"; return }
-        if (measuring) {
-            measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
-            values.text = "Mérés szünetel a vezérlőazonosítás miatt"
-        }
-        identity.text = "Azonosítók kiolvasása folyamatban… Ez több másodpercig tarthat."
-        task { token ->
+        task(onAccepted = { identity.text = "Azonosítók kiolvasása folyamatban… Ez több másodpercig tarthat." },
+            onFailure = { identity.text = "Azonosítás sikertelen: $it" }) { token ->
             val lines = EcuIdentity({ elm.command(it, 8000) }, elm.canProtocol,
                 { token == generation.get() && elm.isConnected() }).report()
-            show(token) { identity.text = "VALÓDI KAPCSOLAT • szabványos azonosítók\n" + lines.joinToString("\n") }
+            show(token) { identity.text = "VALÓDI KAPCSOLAT • ECU: ${elm.selectedSource} • szabványos azonosítók\n" + lines.joinToString("\n") }
         }
     }
 
@@ -155,11 +164,38 @@ class MainActivity : Activity() {
                 "Freeze Frame kiváltó hibakód: P0420\nFordulatszám: 2480.00 1/perc\nHűtőfolyadék: 89 °C"
             return
         }
-        statusReport.text = "VALÓDI ECU • állapot-kiolvasás folyamatban… (K-line-on 5–15 s)"
-        task { token ->
+        task(onAccepted = { statusReport.text = "VALÓDI ECU • állapot-kiolvasás folyamatban… (K-line-on több másodperc)" },
+            onFailure = { statusReport.text = "Az állapot-kiolvasás sikertelen: $it" }) { token ->
             val sections = VehicleStatus({ elm.command(it) }, elm.supported, { elm.isConnected() }).report()
             show(token) { statusReport.text = "VALÓDI ECU\n" + sections.joinToString("\n\n") { "▸ ${it.title}\n" + it.lines.joinToString("\n") } }
         }
+    }
+
+    private fun chooseEcu() {
+        if (demo.isChecked || !elm.isConnected()) { status.text = "Előbb csatlakozz valódi módban"; return }
+        if (connecting || operation || clearDialog?.isShowing == true) { status.text = "Várd meg a folyamatban lévő műveletet"; return }
+        val sources = elm.ecuSources.keys.sorted()
+        ecuDialog?.dismiss()
+        ecuDialog = AlertDialog.Builder(this).setTitle("Válaszoló vezérlő kiválasztása")
+            .setItems(sources.map { "ECU: $it" }.toTypedArray()) { _, index ->
+                if (!elm.isConnected() || operation) return@setItems
+                generation.incrementAndGet()
+                pauseMeasurement("vezérlőváltás")
+                elm.selectEcu(sources[index])
+                latest.clear()
+                values.text = "Új vezérlő • nincs érvényes mérés"
+                errors.text = "Új vezérlő • nincs érvényes hibakód-kiolvasás"
+                statusReport.text = "Új vezérlő • nincs érvényes állapot-kiolvasás"
+                identity.text = "Új vezérlő • nincs érvényes azonosító-kiolvasás"
+                status.text = "VALÓDI • kiválasztott ECU: ${sources[index]}. A cím önmagában nem azonosítja a vezérlő feladatát."
+            }.setNegativeButton("Mégsem", null).create()
+        ecuDialog?.show()
+    }
+
+    private fun pauseMeasurement(reason: String) {
+        if (!measuring) return
+        measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+        values.text = "Mérés szünetel: $reason • a korábbi kijelzés érvénytelen"
     }
 
     private fun connectWifi() {
@@ -183,14 +219,23 @@ class MainActivity : Activity() {
                     if (token != generation.get()) return@execute
                     try {
                         val id = elm.connect(ip, p, { network.socketFactory.createSocket() }, { token != generation.get() })
-                        show(token) { connecting = false; status.text = "VALÓDI • $id" }
+                        show(token) {
+                            connecting = false
+                            status.text = "VALÓDI • $id • kiválasztva: ${elm.selectedSource ?: "nincs, válassz vezérlőt"}"
+                            if (elm.selectedSource == null) chooseEcu()
+                        }
                     } catch (e: Exception) {
                         show(token) { resetSession("Kapcsolódási hiba: ${e.message}") }
                     }
                 }
             }
-            override fun onLost(network: Network) = show(token) {
-                if (network == selected) resetSession("Az adapter Wi-Fi-kapcsolata megszakadt")
+            override fun onLost(network: Network) {
+                val lostCallback = this
+                runOnUiThread {
+                    // ECU selection invalidates readings, but the same network callback remains valid.
+                    if (active && !isDestroyed && networkCallback === lostCallback && network == selected)
+                        resetSession("Az adapter Wi-Fi-kapcsolata megszakadt")
+                }
             }
             override fun onUnavailable() = show(token) { resetSession("Nem érhető el Wi-Fi hálózat") }
         }
@@ -208,10 +253,12 @@ class MainActivity : Activity() {
             return
         }
         if (!elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
+        if (elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
         if (measuring || operation) return
         val supported = LivePlan.sequence(elm.supported)
         if (supported.isEmpty()) { values.text = "VALÓDI ECU • nincs támogatott kijelzési PID"; return }
         measuring = true
+        activeSequence = supported
         latest.clear()
         val token = generation.get()
         scheduleReading(token, readingGeneration.incrementAndGet(), supported, 0)
@@ -225,7 +272,7 @@ class MainActivity : Activity() {
             try {
                 val line = Obd.reading(pid, Obd.bytesFor(elm.command("01%02X".format(pid)), 1, pid))
                 avgPollMs = (avgPollMs * 7 + 200 + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)) / 8
-                val at = System.currentTimeMillis()
+                val at = SystemClock.elapsedRealtime()
                 show(token) { if (measuring && readingToken == readingGeneration.get()) { latest[pid] = line to at; renderLatest(supported) } }
             } catch (e: Exception) {
                 show(token) { if (measuring && readingToken == readingGeneration.get()) {
@@ -239,7 +286,7 @@ class MainActivity : Activity() {
 
     /** Each value keeps its own age; nothing older than its stale limit is shown as current. */
     private fun renderLatest(sequence: List<Int>, note: String? = null) {
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val lines = LivePlan.displayed(sequence.toSet()).map { pid ->
             val entry = latest[pid] ?: return@map "%02X: még nincs érvényes adat".format(pid)
             val age = now - entry.second
@@ -249,17 +296,23 @@ class MainActivity : Activity() {
     }
 
     /** Serialize operations with single-PID polls, never queue an infinite read loop. */
-    private fun task(block: (Int) -> Unit) {
+    private fun task(onAccepted: () -> Unit = {}, onFailure: (String) -> Unit = {}, block: (Int) -> Unit) {
         if (!elm.isConnected() || demo.isChecked) { status.text = "Előbb csatlakozz valódi módban"; return }
+        if (elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
         if (operation) { status.text = "Egy művelet már folyamatban van"; return }
         operation = true
+        pauseMeasurement("diagnosztikai művelet")
+        onAccepted()
         val token = generation.get()
         worker.execute {
             if (token != generation.get()) return@execute
             try { block(token) }
             catch (e: Exception) { show(token) {
-                if (!elm.isConnected()) resetSession("Kapcsolati hiba: ${e.message}")
-                else status.text = "Hiba: ${e.message}"
+                when {
+                    e is ClearOutcomeUnknown -> resetSession(e.message ?: "A törlés eredménye BIZONYTALAN")
+                    !elm.isConnected() -> resetSession("Kapcsolati hiba: ${e.message}")
+                    else -> { status.text = "Hiba: ${e.message}"; onFailure(e.message ?: "Ismeretlen hiba") }
+                }
             } }
             finally { show(token) { operation = false } }
         }
@@ -267,17 +320,20 @@ class MainActivity : Activity() {
 
     private fun prepareClear() {
         if (demo.isChecked || !elm.isConnected()) { status.text = "Törléshez valódi ECU-kapcsolat szükséges"; return }
-        measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
-        values.text = "Mérés szünetel a törlés előkészítése miatt"
+        if (operation) { status.text = "Egy művelet már folyamatban van"; return }
+        elm.clearAvailabilityReason()?.let { status.text = it; return }
         task { token ->
             // Mandatory Mode 03 must decode; optional data is recorded with explicit per-query errors.
             val stored = elm.command("03")
             val codes = Obd.dtcs(stored, elm.canProtocol)
+            val permit = elm.prepareClearPermit(stored)
             val report = JSONObject().put("schema", 1).put("source", "REAL_ECU")
                 .put("timestampUtcMillis", System.currentTimeMillis()).put("complete", false)
-                .put("canProtocol", elm.canProtocol).put("appVersion", BuildConfig.VERSION_NAME)
+                .put("canProtocol", elm.canProtocol).put("selectedEcuSource", elm.selectedSource)
+                .put("responseEncoding", "selected_ecu_normalized_obd_payloads_not_raw_bus_frames")
+                .put("appVersion", BuildConfig.VERSION_NAME)
                 .put("appVersionCode", BuildConfig.VERSION_CODE).put("gitSha", BuildConfig.GIT_SHA)
-                .put("limitations", "RÉSZLEGES: csak a motorvezérlő szabványos OBD-adatai (DTC, readiness, 0. Freeze Frame, járműállapot); más ECU-k és gyártóspecifikus adatok nélkül.")
+                .put("limitations", "RÉSZLEGES: csak a kiválasztott vezérlő szabványos OBD-adatai (DTC, readiness, 0. Freeze Frame, járműállapot); más ECU-k és gyártóspecifikus adatok nélkül.")
                 .put("storedDtcRaw", stored).put("storedDtcDecoded", codes.joinToString(","))
             val queries = JSONObject()
             for (cmd in listOf("07", "0A", "0101", "020200", "020000")) {
@@ -315,28 +371,33 @@ class MainActivity : Activity() {
             FileOutputStream(file).use { output -> output.write(content.toByteArray(Charsets.UTF_8)); output.fd.sync() }
             check(file.readText(Charsets.UTF_8) == content) { "A mentés visszaolvasása sikertelen; törlés tiltva" }
             show(token) {
+                val remainingMs = (ClearPermit.LIFETIME_NANOS - (System.nanoTime() - permit.createdAtNanos)) / 1_000_000
+                if (remainingMs <= 0) { status.text = "A mentés lejárt; indítsd újra a törlés előkészítését"; return@show }
                 clearDialog = AlertDialog.Builder(this).setTitle("Részleges mentés elkészült. Törlöd a hibakódokat?")
-                    .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt és függő DTC, readiness, a 0. Freeze Frame összes támogatott PID-je és járműállapot. Más ECU-k és gyártóspecifikus adatok nincsenek benne; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél, ráadott gyújtással és LEÁLLÍTOTT motorral: a 04 elküldése előtt az alkalmazás frissen ellenőrzi, hogy a fordulatszám és a sebesség 0. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
+                    .setMessage("Mentve az alkalmazás saját tárhelyére: ${file.name}\nRÉSZLEGES mentés: tárolt és függő DTC, readiness, a 0. Freeze Frame összes támogatott PID-je és járműállapot. Más ECU-k és gyártóspecifikus adatok nincsenek benne; egyes adatok hiányozhatnak. Az alkalmazás eltávolítása a mentést is törli.\n\nA megerősítés legfeljebb 2 percig érvényes a hibakódok mentésétől számítva. Megváltozott hibakódlista esetén új mentés szükséges. A Mode 04 törölheti a hibakódokat, Freeze Frame adatokat és alaphelyzetbe állíthatja a readiness monitorokat. Csak álló járműnél, ráadott gyújtással és LEÁLLÍTOTT motorral: a 04 elküldése előtt az alkalmazás frissen ellenőrzi, hogy a fordulatszám és a sebesség 0. A hiányzó adatokat a mentésből nem lehet helyreállítani.")
                     .setNegativeButton("Mégsem", null)
                     .setPositiveButton("Részleges mentéssel is törlöm") { _, _ ->
                         if (token == generation.get() && !demo.isChecked) task { clearToken ->
-                            // Fresh engine-off / standstill proof immediately before Mode 04; unverifiable means no clear.
-                            val rpm = try { Obd.bytesFor(elm.command("010C"), 1, 0x0C) } catch (e: Exception) { if (!elm.isConnected()) throw e; null }
-                            val speedSupported = 0x0D in elm.supported
-                            val speed = if (!speedSupported) null else try { Obd.bytesFor(elm.command("010D"), 1, 0x0D) } catch (e: Exception) { if (!elm.isConnected()) throw e; null }
-                            Obd.clearBlockReason(rpm, speed, speedSupported)?.let { reason -> error("$reason. A 04 parancs NEM lett elküldve.") }
-                            val reply = elm.command("04")
-                            check(Obd.clearAcknowledged(reply)) { "A törlés NEM igazolt: $reply. Ismételt kiolvasás szükséges." }
+                            elm.clearDtcs(permit) { clearToken == generation.get() }
                             show(clearToken) { errors.text = "VALÓDI ECU • törlés visszaigazolva; olvasd ki ismét a hibakódokat" }
                         }
                     }.create()
-                clearDialog?.show()
+                val shownDialog = clearDialog
+                val expire = Runnable {
+                    if (clearDialog === shownDialog && shownDialog?.isShowing == true) {
+                        shownDialog.dismiss()
+                        status.text = "A törlési megerősítés lejárt; új mentés szükséges"
+                    }
+                }
+                shownDialog?.setOnDismissListener { ui.removeCallbacks(expire); if (clearDialog === shownDialog) clearDialog = null }
+                shownDialog?.show()
+                ui.postDelayed(expire, remainingMs)
             }
         }
     }
 
     private fun show(token: Int, block: () -> Unit) { runOnUiThread { if (active && token == generation.get() && !isDestroyed) block() } }
-    override fun onStart() { super.onStart(); active = true }
-    override fun onStop() { active = false; resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
+    override fun onStart() { super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick) }
+    override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdownNow(); super.onDestroy() }
 }

@@ -32,6 +32,7 @@ android {
         buildConfigField("int", "BUILD_NUMBER", "$buildNumber")
     }
     buildFeatures { buildConfig = true }
+    testOptions { unitTests.isIncludeAndroidResources = true }
     signingConfigs {
         if (keystorePath != null) create("stable") {
             storeFile = file(keystorePath)
@@ -50,4 +51,8 @@ android {
 }
 
 
-dependencies { testImplementation("junit:junit:4.13.2") }
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+}
+

@@ -24,7 +24,7 @@ class EcuIdentity(
             val reply = attempt { ask(command).replace('>', ' ').trim().also { require(it.isNotEmpty()) } }
             lines += "$label: " + reply.getOrElse { "nem elérhető (${it.message})" }
         }
-        val supported = attempt { supportMask(ask("0900")) }
+        val supported = attempt { supportMask(ask("0900"), canProtocol) }
         if (supported.isFailure) lines += "Mode 09 támogatási maszk nem elérhető; az azonosítókat külön megpróbáljuk kiolvasni."
         for ((pid, label) in listOf(2 to "VIN", 4 to "Kalibrációazonosító (CAL ID)", 6 to "Kalibráció ellenőrzőszáma (CVN)", 10 to "ECU neve")) {
             if (supported.getOrNull()?.let { pid !in it } == true) {
@@ -42,11 +42,19 @@ class EcuIdentity(
     }
 
     companion object {
-        fun supportMask(response: String): Set<Int> {
-            val bytes = Obd.bytesFor(response, 9, 0)
+        fun supportMask(response: String, canProtocol: Boolean = true): Set<Int> {
+            val payload = Obd.bytesFor(response, 9, 0)
+            // Accommodate the single numbered legacy support record, without accepting it on CAN.
+            val bytes = if (!canProtocol && payload.size == 5 && payload.first() == 1) payload.drop(1) else payload
             require(bytes.size == 4) { "Hibás Mode 09 támogatási maszk" }
             val mask = bytes.fold(0L) { value, byte -> (value shl 8) or byte.toLong() }
             return (1..32).filter { mask and (1L shl (32 - it)) != 0L }.toSet()
+        }
+
+        private fun ascii(bytes: List<Int>): String {
+            val textBytes = bytes.dropLastWhile { it == 0 || it == 32 }
+            require(textBytes.isNotEmpty() && textBytes.all { it in 32..126 }) { "Hibás azonosítószöveg" }
+            return textBytes.map { it.toChar() }.joinToString("")
         }
 
         /** Reject ambiguous headerless multi-ECU replies instead of joining unrelated identities. */
@@ -79,9 +87,11 @@ class EcuIdentity(
             }
             return records.map { (source, bytes) ->
                 val value = if (pid == 6) bytes.joinToString("") { "%02X".format(it) } else {
-                    val textBytes = bytes.dropLastWhile { it == 0 || it == 32 }
-                    require(textBytes.isNotEmpty() && textBytes.all { it in 32..126 }) { "Hibás azonosítószöveg" }
-                    textBytes.map { it.toChar() }.joinToString("").also {
+                    val text = if (pid == 10 && bytes[4] == 0x2D) {
+                        // The four-byte acronym may be NUL padded before the fixed '-' delimiter.
+                        ascii(bytes.take(4)) + " — " + ascii(bytes.drop(5))
+                    } else ascii(bytes)
+                    text.also {
                         if (pid == 2) require(it.matches(Regex("[A-HJ-NPR-Z0-9]{17}"))) { "Érvénytelen VIN" }
                     }
                 }

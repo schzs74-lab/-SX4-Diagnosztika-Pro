@@ -29,9 +29,9 @@ class Elm327Test {
                         if (reply(cmd, socket)) continue
                         val response = when (cmd) {
                             "ATZ", "ATI" -> "ELM327 v1.5"
-                            "0100" -> "41 00 00 10 00 00"
+                            "0100" -> "7E8 06 41 00 00 10 00 00"
                             "ATDPN" -> "A6"
-                            else -> "OK"
+                            else -> if (cmd.startsWith("AT")) "OK" else "NO DATA"
                         }
                         socket.getOutputStream().write((response + "\r>").toByteArray())
                         socket.getOutputStream().flush()
@@ -70,7 +70,7 @@ class Elm327Test {
     }
     @Test fun supportPagesBeyondFirstAreChained() {
         Adapter { cmd, s ->
-            val reply = when (cmd) { "0100" -> "41 00 00 10 00 01"; "0120" -> "41 20 80 02 00 00"; else -> null }
+            val reply = when (cmd) { "0100" -> "7E8 06 41 00 00 10 00 01"; "0120" -> "7E8 06 41 20 80 02 00 00"; else -> null }
             reply?.let { s.getOutputStream().write("$it\r>".toByteArray()); s.getOutputStream().flush(); true } ?: false
         }.use { adapter ->
             val elm = Elm327()
@@ -82,7 +82,7 @@ class Elm327Test {
     }
     @Test fun refusedSupportPageKeepsConnection() {
         Adapter { cmd, s ->
-            val reply = when (cmd) { "0100" -> "41 00 00 10 00 01"; "0120" -> "NO DATA"; else -> null }
+            val reply = when (cmd) { "0100" -> "7E8 06 41 00 00 10 00 01"; "0120" -> "NO DATA"; else -> null }
             reply?.let { s.getOutputStream().write("$it\r>".toByteArray()); s.getOutputStream().flush(); true } ?: false
         }.use { adapter ->
             val elm = Elm327()
@@ -109,7 +109,7 @@ class Elm327Test {
         Adapter { cmd, s ->
             when (cmd) {
                 "0105" -> {
-                    for (part in listOf("41 ", "05 ", "80\r", ">")) {
+                    for (part in listOf("7E8 03 41 ", "05 ", "80\r", ">")) {
                         s.getOutputStream().write(part.toByteArray()); s.getOutputStream().flush()
                         Thread.sleep(10)
                     }; true
@@ -173,7 +173,7 @@ class Elm327Test {
     }
     @Test fun writeCommandsAreRejected() {
         val elm = Elm327()
-        try { listOf("ATSH7E0", "2E123400", "0908", "090B", "0902\r04", "04\r04").forEach { cmd -> assertThrows(IllegalArgumentException::class.java) { elm.command(cmd) } } }
+        try { listOf("04", "ATH0", "ATZ", "ATSH7E0", "2E123400", "0908", "090B", "0902\r04", "04\r04").forEach { cmd -> assertThrows(IllegalArgumentException::class.java) { elm.command(cmd) } } }
         finally { elm.close() }
     }
 
@@ -184,11 +184,136 @@ class Elm327Test {
             try {
                 adapter.connect(elm)
                 val reads = listOf("0900", "0902", "0904", "0906", "090A")
-                reads.forEach { assertEquals("OK", elm.command(it).trim()) }
+                reads.forEach { assertEquals("NO DATA", elm.command(it).trim()) }
                 assertEquals(reads, seen.filter { it.startsWith("09") })
                 assertThrows(IllegalArgumentException::class.java) { elm.command("2E123400") }
                 assertFalse(seen.contains("2E123400"))
             } finally { elm.close() }
         }
     }
+    private fun reply(socket: Socket, value: String): Boolean {
+        socket.getOutputStream().write((value + "\r>").toByteArray())
+        socket.getOutputStream().flush()
+        return true
+    }
+
+    @Test fun multipleCanEcusConnectButRequireExplicitSelection() {
+        Adapter { cmd, socket ->
+            when (cmd) {
+                "0100" -> reply(socket, "7E8 06 41 00 00 10 00 00\r7E9 06 41 00 08 00 00 00")
+                "0105" -> reply(socket, "7E8 03 41 05 80\r7E9 03 41 05 90")
+                else -> false
+            }
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                assertTrue(elm.isConnected()); assertNull(elm.selectedSource)
+                assertThrows(IllegalStateException::class.java) { elm.command("0105") }
+                elm.selectEcu("7E9")
+                assertEquals(setOf(5), elm.supported)
+                assertEquals(listOf(0x90), Obd.bytesFor(elm.command("0105"), 1, 5))
+                assertNotNull(elm.clearAvailabilityReason())
+                assertThrows(IllegalStateException::class.java) { elm.prepareClearPermit("43 00") }
+            } finally { elm.close() }
+        }
+    }
+
+    @Test fun kLineMultipleEcusKeepIndependentSupportAndData() {
+        Adapter { cmd, socket ->
+            when (cmd) {
+                "ATDPN" -> reply(socket, "A3")
+                "0100" -> reply(socket, "48 6B 10 41 00 BE 3E B8 11 FA\r48 6B 18 41 00 80 10 80 00 C0")
+                "0120" -> reply(socket, "NO DATA")
+                "0105" -> reply(socket, "48 6B 10 41 05 80 89\r48 6B 18 41 05 90 A1")
+                else -> false
+            }
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm); assertFalse(elm.canProtocol)
+                assertEquals(setOf("10", "18"), elm.ecuSources.keys)
+                elm.selectEcu("10")
+                assertEquals(listOf(0x80), Obd.bytesFor(elm.command("0105"), 1, 5))
+                elm.selectEcu("18")
+                assertEquals(listOf(0x90), Obd.bytesFor(elm.command("0105"), 1, 5))
+            } finally { elm.close() }
+        }
+    }
+
+    private fun clearAdapter(seen: MutableList<String>, variant: String = "ok") = Adapter { cmd, socket ->
+        seen += cmd
+        when (cmd) {
+            "0100" -> reply(socket, if (variant == "newEcu" && seen.count { it == "0100" } > 1)
+                "7E8 06 41 00 00 18 00 00\r7E9 06 41 00 00 10 00 00" else "7E8 06 41 00 00 18 00 00")
+            "03" -> reply(socket, if (variant == "newCode") "7E8 04 43 01 01 33" else "7E8 04 43 01 04 20")
+            "010C" -> reply(socket, if (variant == "running") "7E8 04 41 0C 0C 30" else "7E8 04 41 0C 00 00")
+            "010D" -> reply(socket, if (variant == "moving") "7E8 03 41 0D 05" else "7E8 03 41 0D 00")
+            "04" -> if (variant == "lostAck") { socket.close(); true }
+                else reply(socket, if (variant == "wrongAck") "7E9 01 44" else "7E8 01 44")
+            else -> false
+        }
+    }
+
+    @Test fun dedicatedClearChecksFreshCodesAndStandstillBeforeSending() {
+        val seen = mutableListOf<String>()
+        clearAdapter(seen).use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                val permit = elm.prepareClearPermit(elm.command("03"))
+                elm.clearDtcs(permit)
+                assertEquals(listOf("0100", "03", "010C", "010D", "04"), seen.takeLast(5))
+                assertThrows(IllegalArgumentException::class.java) { elm.command("04") }
+            } finally { elm.close() }
+        }
+    }
+
+    @Test fun changedCodesRunningMovingAndNewResponderNeverSendClear() {
+        for (variant in listOf("newCode", "running", "moving", "newEcu")) {
+            val seen = mutableListOf<String>()
+            clearAdapter(seen, variant).use { adapter ->
+                val elm = Elm327()
+                try {
+                    adapter.connect(elm)
+                    val permit = elm.prepareClearPermit("43 01 04 20")
+                    assertThrows(Exception::class.java) { elm.clearDtcs(permit) }
+                    assertFalse(variant, seen.contains("04"))
+                } finally { elm.close() }
+            }
+        }
+    }
+
+    @Test fun cancelledExpiredOrOldSessionPermitNeverSendsClear() {
+        val seen = mutableListOf<String>()
+        clearAdapter(seen).use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                val permit = elm.prepareClearPermit("43 01 04 20")
+                assertThrows(IllegalStateException::class.java) { elm.clearDtcs(permit) { false } }
+                assertThrows(IllegalStateException::class.java) { elm.clearDtcs(permit.copy(createdAtNanos = System.nanoTime() - ClearPermit.LIFETIME_NANOS - 1)) }
+                elm.disconnect()
+                assertThrows(IllegalStateException::class.java) { elm.clearDtcs(permit) }
+                assertFalse(seen.contains("04"))
+            } finally { elm.close() }
+        }
+    }
+
+    @Test fun lostOrWrongSourceAcknowledgementReportsUnknownWithoutRetry() {
+        for (variant in listOf("lostAck", "wrongAck")) {
+            val seen = mutableListOf<String>()
+            clearAdapter(seen, variant).use { adapter ->
+                val elm = Elm327()
+                try {
+                    adapter.connect(elm)
+                    val permit = elm.prepareClearPermit("43 01 04 20")
+                    val failure = assertThrows(ClearOutcomeUnknown::class.java) { elm.clearDtcs(permit) }
+                    assertTrue(failure.message!!.contains("BIZONYTALAN"))
+                    assertEquals(1, seen.count { it == "04" })
+                } finally { elm.close() }
+            }
+        }
+    }
+
 }
