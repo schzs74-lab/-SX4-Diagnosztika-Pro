@@ -25,9 +25,9 @@ android {
     namespace = "hu.sx4.diagnosztika"
     compileSdk = 35
     defaultConfig {
-        applicationId = "hu.sx4.diagnosztika"; minSdk = 26; targetSdk = 35
+        applicationId = "hu.sx4.diagnosztika.teszt"; minSdk = 26; targetSdk = 35
         versionCode = buildNumber
-        versionName = "$baseVersion-build$buildNumber"
+        versionName = "$baseVersion-teszt-build$buildNumber"
         buildConfigField("String", "GIT_SHA", "\"$gitSha${if (gitDirty) "-dirty" else ""}\"")
         buildConfigField("int", "BUILD_NUMBER", "$buildNumber")
     }
