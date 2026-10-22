@@ -6,6 +6,8 @@ package hu.sx4.diagnosztika
  * Fast PIDs are read every cycle, slow ones one per cycle.
  */
 object LivePlan {
+    /** Narrowband voltage channels only, each queried at its own timestamp. */
+    fun oxygenSequence(supported: Set<Int>): List<Int> = listOf(0x14, 0x15).filter { it in supported }
     /** 24 and 44 only exist with a wideband upstream sensor; then they replace 14 as the fast lambda signal. */
     val fast = listOf(0x0C, 0x04, 0x11, 0x06, 0x14, 0x15, 0x24, 0x44, 0x0B, 0x10)
     val slow = listOf(0x05, 0x07, 0x03, 0x0D, 0x0F, 0x0E, 0x25, 0x43, 0x45, 0x2F, 0x42, 0x33, 0x46, 0x3C)

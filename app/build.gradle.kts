@@ -32,7 +32,10 @@ android {
         buildConfigField("int", "BUILD_NUMBER", "$buildNumber")
     }
     buildFeatures { buildConfig = true }
-    testOptions { unitTests.isIncludeAndroidResources = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { it.systemProperty("sx4.previewDir", layout.buildDirectory.dir("reports/screenshots").get().asFile.absolutePath) }
+    }
     signingConfigs {
         if (keystorePath != null) create("stable") {
             storeFile = file(keystorePath)
@@ -52,6 +55,7 @@ android {
 
 
 dependencies {
+    implementation("androidx.core:core:1.15.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
 }

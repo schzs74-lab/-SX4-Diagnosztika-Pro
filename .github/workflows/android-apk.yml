@@ -106,6 +106,7 @@ jobs:
           name: SX4-test-reports
           path: |
             app/build/reports/tests/
+            app/build/reports/screenshots/
             app/build/test-results/
             app/build/reports/lint-results-debug.*
       - name: APK feltöltése

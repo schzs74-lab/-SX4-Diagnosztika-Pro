@@ -3,6 +3,7 @@ package hu.sx4.diagnosztika
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.net.ConnectivityManager
 import android.net.Network
@@ -40,6 +41,7 @@ class MainActivity : Activity() {
         override fun run() {
             if (!active) return
             if (measuring && activeSequence.isNotEmpty()) renderLatest(activeSequence)
+            oxygenChart.tick(SystemClock.elapsedRealtime())
             ui.postDelayed(this, 500)
         }
     }
@@ -51,6 +53,15 @@ class MainActivity : Activity() {
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var demo: Switch
+    private lateinit var oxygenMode: Switch
+    private lateinit var oxygenChart: OxygenChartView
+    private lateinit var recordingInfo: TextView
+    private val recordLock = Any()
+    private val recordEpoch = AtomicInteger()
+    @Volatile private var recording: MeasurementLog? = null
+    private var recordStartPending = false
+    private var pendingExportName: String? = null
+    private val measurementsDir get() = File(filesDir, "measurements")
     /** Latest decoded line per PID with its receive time; read and written on the UI thread only. */
     private val latest = LinkedHashMap<Int, Pair<String, Long>>()
     /** Moving average of one poll (delay + request), the basis of each PID's stale limit. */
@@ -63,6 +74,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingExportName = savedInstanceState?.getString("pendingExportName")
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 30, 28, 30) }
         scroll.addView(root); setContentView(scroll)
@@ -106,10 +118,32 @@ class MainActivity : Activity() {
         }
         title("Élő motoradatok")
         values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
+        oxygenMode = Switch(this).apply { text = "Gyors szondamérés • csak B1S1 és B1S2"; root.addView(this) }
         button("Élő adatok indítása") { startReading() }
-        button("Mérés leállítása") {
-            measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
-            values.text = "Mérés leállítva • a korábbi kijelzés érvénytelen"
+        button("Mérés leállítása") { pauseMeasurement("kézi leállítás") }
+        title("Lambdaszondák • utolsó 60 másodperc")
+        oxygenChart = OxygenChartView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (280*resources.displayMetrics.density).toInt())
+            root.addView(this)
+        }
+        TextView(this).apply {
+            text = "A szondák eltérő időpontban frissülnek. A pontok valódi minták; 5 másodpercnél nagyobb adathiány megszakítja a görbét. A grafikon önmagában nem katalizátorteszt."
+            root.addView(this)
+        }
+        title("Mérésmentés • CSV")
+        recordingInfo = TextView(this).apply { text = "Nincs aktív rögzítés"; textSize = 16f; root.addView(this) }
+        button("Rögzítés indítása") { startRecording() }
+        button("Rögzítés lezárása és mentése") { stopRecording("kézi mentés") }
+        button("Mentett mérés megosztása") { chooseMeasurement(share = true) }
+        button("Mentett mérés mentése fájlba") { chooseMeasurement(share = false) }
+        TextView(this).apply {
+            text = "A rögzítés legfeljebb 60 percig vagy 10 MB-ig tart. Diagnosztikai művelet, vezérlőváltás vagy háttérbe lépés lezárja. Megosztás után új adapterkapcsolat szükséges. A belső mentéseket az alkalmazás eltávolítása törli; a Fájlba mentés külön példányt készít."
+            root.addView(this)
+        }
+        oxygenMode.setOnCheckedChangeListener { _, _ ->
+            pauseMeasurement("mérési mód váltása")
+            latest.clear(); oxygenChart.reset()
+            values.text = "Mérési mód megváltozott • indítsd újra az élő adatokat"
         }
         title("Hibakód-diagnosztika")
         errors = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize = 16f; root.addView(this) }
@@ -140,6 +174,7 @@ class MainActivity : Activity() {
 
     private fun resetSession(message: String) {
         generation.incrementAndGet(); measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+        stopRecording(message); oxygenChart.reset()
         connecting = false; operation = false
         clearDialog?.dismiss(); clearDialog = null
         ecuDialog?.dismiss(); ecuDialog = null
@@ -189,6 +224,7 @@ class MainActivity : Activity() {
                 if (!elm.isConnected() || operation) return@setItems
                 generation.incrementAndGet()
                 pauseMeasurement("vezérlőváltás")
+                oxygenChart.reset()
                 elm.selectEcu(sources[index])
                 latest.clear()
                 values.text = "Új vezérlő • nincs érvényes mérés"
@@ -201,8 +237,10 @@ class MainActivity : Activity() {
     }
 
     private fun pauseMeasurement(reason: String) {
+        stopRecording(reason)
         if (!measuring) return
         measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
+        oxygenChart.pause(SystemClock.elapsedRealtime())
         values.text = "Mérés szünetel: $reason • a korábbi kijelzés érvénytelen"
     }
 
@@ -256,39 +294,48 @@ class MainActivity : Activity() {
     }
 
     private fun startReading() {
-        if (demo.isChecked) {
-            values.text = "DEMO / SZIMULÁLT\nFordulatszám: 780 1/perc\nHűtőfolyadék: 88 °C\nSebesség: 0 km/h\nSTFT: +3,1%\nLTFT: +5,5%\nFojtószelep: 12%"
-            return
-        }
-        if (!elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
-        if (elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
-        if (measuring || operation) return
-        val supported = LivePlan.sequence(elm.supported)
-        if (supported.isEmpty()) { values.text = "VALÓDI ECU • nincs támogatott kijelzési PID"; return }
-        measuring = true
-        activeSequence = supported
-        latest.clear()
-        val token = generation.get()
-        scheduleReading(token, readingGeneration.incrementAndGet(), supported, 0)
+        if (measuring || operation || connecting) return
+        val simulated = demo.isChecked
+        if (!simulated && !elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
+        if (!simulated && elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
+        val available = if (simulated) DemoSamples.supported else elm.supported
+        val sequence = if (oxygenMode.isChecked) LivePlan.oxygenSequence(available) else LivePlan.sequence(available)
+        if (sequence.isEmpty()) { values.text = "Ehhez a mérési módhoz nincs támogatott PID"; return }
+        measuring = true; activeSequence = sequence; latest.clear()
+        oxygenChart.start(simulated, available, SystemClock.elapsedRealtime())
+        renderLatest(sequence)
+        scheduleReading(generation.get(), readingGeneration.incrementAndGet(), sequence, 0, simulated)
     }
 
-    private fun scheduleReading(token: Int, readingToken: Int, supported: List<Int>, index: Int) {
+    private fun scheduleReading(token: Int, readingToken: Int, sequence: List<Int>, index: Int, simulated: Boolean) {
         poll = worker.schedule({
             if (!measuring || token != generation.get() || readingToken != readingGeneration.get()) return@schedule
-            val pid = supported[index]
+            val pid = sequence[index]
             val started = System.nanoTime()
             try {
-                val line = Obd.reading(pid, Obd.bytesFor(elm.command("01%02X".format(pid)), 1, pid))
+                val data = if (simulated) DemoSamples.data(pid, SystemClock.elapsedRealtime())
+                    else Obd.bytesFor(elm.command("01%02X".format(pid)), 1, pid)
+                val sample = LiveSample.decode(pid, data)
                 avgPollMs = (avgPollMs * 7 + 200 + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)) / 8
                 val at = SystemClock.elapsedRealtime()
-                show(token) { if (measuring && readingToken == readingGeneration.get()) { latest[pid] = line to at; renderLatest(supported) } }
+                if (measuring && token == generation.get() && readingToken == readingGeneration.get()) {
+                    appendRecording(sample, at, token)
+                    show(token) { if (measuring && readingToken == readingGeneration.get()) {
+                        latest[pid] = sample.reading to at; oxygenChart.sample(sample, at); renderLatest(sequence)
+                    } }
+                }
             } catch (e: Exception) {
-                show(token) { if (measuring && readingToken == readingGeneration.get()) {
-                    latest.remove(pid); renderLatest(supported, "%02X: nincs érvényes friss mérés • %s".format(pid, e.message))
-                } }
-                if (!elm.isConnected()) { show(token) { resetSession("A TCP-kapcsolat megszakadt: ${e.message}") }; return@schedule }
+                if (measuring && token == generation.get() && readingToken == readingGeneration.get()) {
+                    appendRecordingFailure(pid, e.message ?: "Ismeretlen hiba", SystemClock.elapsedRealtime(), token)
+                    show(token) { if (measuring && readingToken == readingGeneration.get()) {
+                        latest.remove(pid); oxygenChart.gap(pid)
+                        renderLatest(sequence, "%02X: nincs érvényes friss mérés • %s".format(pid, e.message))
+                    } }
+                }
+                if (!simulated && !elm.isConnected()) { show(token) { resetSession("A TCP-kapcsolat megszakadt: ${e.message}") }; return@schedule }
             }
-            if (measuring && token == generation.get() && readingToken == readingGeneration.get()) scheduleReading(token, readingToken, supported, (index + 1) % supported.size)
+            if (measuring && token == generation.get() && readingToken == readingGeneration.get())
+                scheduleReading(token, readingToken, sequence, (index + 1) % sequence.size, simulated)
         }, 200, TimeUnit.MILLISECONDS)
     }
 
@@ -300,7 +347,142 @@ class MainActivity : Activity() {
             val age = now - entry.second
             if (age > LivePlan.staleAfterMs(pid, sequence, avgPollMs)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
         }
-        values.text = "VALÓDI ECU • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + (note?.let { "\n$it" } ?: "")
+        values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + (note?.let { "\n$it" } ?: "")
+    }
+
+    private fun startRecording() {
+        if (recording != null || recordStartPending) { recordingInfo.text = "A rögzítés már folyamatban van"; return }
+        if (operation || connecting) { recordingInfo.text = "Várd meg a diagnosztikai művelet végét"; return }
+        startReading()
+        if (!measuring) return
+        val token = generation.get()
+        val request = recordEpoch.incrementAndGet()
+        val mode = if (demo.isChecked) "DEMO" else "REAL"
+        val source = if (demo.isChecked) "DEMO" else elm.selectedSource ?: return
+        val profile = if (oxygenMode.isChecked) "OXYGEN_ONLY" else "ALL_LIVE_PIDS"
+        recordStartPending = true
+        recordingInfo.text = "Rögzítés előkészítése…"
+        worker.execute {
+            if (request != recordEpoch.get() || token != generation.get() || !measuring) return@execute
+            var opened: MeasurementLog? = null
+            try {
+                val target = MeasurementLog(measurementsDir, mode, source, profile, BuildConfig.VERSION_NAME,
+                    System.currentTimeMillis(), SystemClock.elapsedRealtime())
+                opened = target
+                val accepted = synchronized(recordLock) {
+                    if (request == recordEpoch.get() && token == generation.get() && measuring) {
+                        recording = target; true
+                    } else false
+                }
+                if (!accepted) { target.finish("Megszakított indítás", SystemClock.elapsedRealtime()); return@execute }
+                show(token) { if (request == recordEpoch.get()) {
+                    recordStartPending = false
+                    recordingInfo.text = "${if (mode == "DEMO") "DEMO / SZIMULÁLT" else "VALÓDI ECU: $source"} • rögzítés folyamatban\n${target.file.name}"
+                } }
+            } catch (e: Exception) {
+                opened?.abort()
+                synchronized(recordLock) { if (recording === opened) recording = null }
+                show(token) { if (request == recordEpoch.get()) {
+                    recordStartPending = false; recordingInfo.text = "Rögzítési hiba: ${e.message}"
+                } }
+            }
+        }
+    }
+
+    private fun stopRecording(reason: String) {
+        val wasPending = recordStartPending
+        recordStartPending = false
+        val (request, target) = synchronized(recordLock) {
+            val request = recordEpoch.incrementAndGet()
+            val previous = recording; recording = null
+            request to previous
+        }
+        if (target == null) {
+            if (wasPending) recordingInfo.text = "A rögzítés indítása megszakítva"
+            return
+        }
+        val at = SystemClock.elapsedRealtime()
+        val token = generation.get()
+        recordingInfo.text = "Mérés lezárása és mentése…"
+        worker.execute {
+            try {
+                val file = target.finish(reason, at)
+                show(token) { if (request == recordEpoch.get()) {
+                    recordingInfo.text = "Mentve • ${target.rows} minta • $reason\n${file.name}"
+                } }
+            } catch (e: Exception) {
+                target.abort()
+                show(token) { if (request == recordEpoch.get()) { recordingInfo.text = "A mérés mentése sikertelen: ${e.message}" } }
+            }
+        }
+    }
+
+    /** Local file failures never become OBD transport failures. Called only by the polling worker. */
+    private fun appendRecording(sample: LiveSample, at: Long, token: Int) = recordRow(token) { it.append(sample, at) }
+    private fun appendRecordingFailure(pid: Int, error: String, at: Long, token: Int) = recordRow(token) { it.failure(pid, error, at) }
+    private fun recordRow(token: Int, append: (MeasurementLog) -> Boolean) {
+        val target = recording ?: return
+        val request = recordEpoch.get()
+        try {
+            if (!append(target)) {
+                synchronized(recordLock) { if (recording === target) recording = null }
+                show(token) { if (request == recordEpoch.get()) {
+                    recordingInfo.text = "Rögzítés lezárva • idő- vagy méretkorlát • ${target.rows} minta\n${target.file.name}"
+                } }
+            }
+        } catch (e: Exception) {
+            target.abort()
+            synchronized(recordLock) { if (recording === target) recording = null }
+            show(token) { if (request == recordEpoch.get()) { recordingInfo.text = "Rögzítési hiba: ${e.message}" } }
+        }
+    }
+
+    private fun refreshRecordingSummary() {
+        val files = MeasurementLog.saved(measurementsDir)
+        recordingInfo.text = if (files.isEmpty()) "Nincs aktív rögzítés • még nincs mentett mérés"
+            else "${files.size} mentett mérés • legutóbbi:\n${files.first().name}"
+    }
+
+    private fun chooseMeasurement(share: Boolean) {
+        if (recording != null || recordStartPending) { recordingInfo.text = "Előbb zárd le és mentsd a rögzítést"; return }
+        val files = MeasurementLog.saved(measurementsDir).take(100)
+        if (files.isEmpty()) { recordingInfo.text = "Még nincs mentett mérés"; return }
+        AlertDialog.Builder(this).setTitle(if (share) "Melyik mérést osztod meg?" else "Melyik mérést mented fájlba?")
+            .setItems(files.map { "${it.name}\n${(it.length()+1023)/1024} KB" }.toTypedArray()) { _, index ->
+                try {
+                    val file = files[index]
+                    if (share) startActivity(Intent.createChooser(MeasurementSharing.shareIntent(this, file), "Mérés megosztása"))
+                    else {
+                        pendingExportName = file.name
+                        startActivityForResult(MeasurementSharing.saveIntent(file), 4102)
+                    }
+                } catch (e: Exception) { recordingInfo.text = "A fájlművelet nem indítható: ${e.message}" }
+            }.setNegativeButton("Mégsem", null).show()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("pendingExportName", pendingExportName)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 4102) return
+        val name = pendingExportName; pendingExportName = null
+        if (resultCode != RESULT_OK || data?.data == null || name == null) { recordingInfo.text = "Fájlba mentés megszakítva"; return }
+        val file = MeasurementLog.saved(measurementsDir).firstOrNull { it.name == name }
+        if (file == null) { recordingInfo.text = "A forrásmérés már nem érhető el"; return }
+        val uri = data.data!!
+        if (uri.scheme != "content") { recordingInfo.text = "Nem támogatott célhely"; return }
+        val token = generation.get()
+        recordingInfo.text = "CSV-fájl másolása…"
+        worker.execute {
+            try {
+                val output = contentResolver.openOutputStream(uri, "wt") ?: error("A célfájl nem nyitható meg")
+                output.use { destination -> file.inputStream().use { it.copyTo(destination) }; destination.flush() }
+                show(token) { recordingInfo.text = "CSV-fájl elmentve a választott helyre:\n${file.name}" }
+            } catch (e: Exception) { show(token) { recordingInfo.text = "A fájlba mentés sikertelen: ${e.message}" } }
+        }
     }
 
     /** Serialize operations with single-PID polls, never queue an infinite read loop. */
@@ -422,7 +604,8 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick)
         if (clearState.getBoolean("clearPending", false)) status.text = clearWarning()
+        if (recording == null && !recordStartPending) refreshRecordingSummary()
     }
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
-    override fun onDestroy() { active = false; elm.close(); worker.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
