@@ -2,9 +2,11 @@ package hu.sx4.diagnosztika
 
 import android.content.Intent
 import android.net.Uri
+import android.content.pm.PackageManager
 import androidx.core.content.FileProvider
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.Before
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
@@ -14,6 +16,15 @@ import java.io.File
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk=[28])
 class MeasurementSharingTest {
+    @Before fun attachProviderToCurrentSandbox() {
+        // FileProvider keeps a static root cache while Robolectric gives each test
+        // a different filesDir. Reattach as Android does when a process starts.
+        val context = RuntimeEnvironment.getApplication()
+        val info = context.packageManager.resolveContentProvider(
+            "${context.packageName}.measurements", PackageManager.GET_META_DATA
+        )!!
+        MeasurementFileProvider().attachInfo(context, info)
+    }
     @Test fun shareUsesContentUriAndReadOnlyTemporaryGrant() {
         val context = RuntimeEnvironment.getApplication()
         val dir = File(context.filesDir, "measurements").apply { mkdirs() }
