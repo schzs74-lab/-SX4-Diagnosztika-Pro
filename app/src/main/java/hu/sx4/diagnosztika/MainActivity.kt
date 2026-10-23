@@ -56,11 +56,14 @@ class MainActivity : Activity() {
     private lateinit var oxygenMode: Switch
     private lateinit var oxygenChart: OxygenChartView
     private lateinit var recordingInfo: TextView
+    private lateinit var diagnosticReportInfo: TextView
     private val recordLock = Any()
     private val recordEpoch = AtomicInteger()
     @Volatile private var recording: MeasurementLog? = null
     private var recordStartPending = false
     private var pendingExportName: String? = null
+    private var pendingReportExportName: String? = null
+    private val reportsDir get() = File(filesDir, "reports")
     private val measurementsDir get() = File(filesDir, "measurements")
     /** Latest decoded line per PID with its receive time; read and written on the UI thread only. */
     private val latest = LinkedHashMap<Int, Pair<String, Long>>()
@@ -75,6 +78,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingExportName = savedInstanceState?.getString("pendingExportName")
+        pendingReportExportName = savedInstanceState?.getString("pendingReportExportName")
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 30, 28, 30) }
         scroll.addView(root); setContentView(scroll)
@@ -161,7 +165,18 @@ class MainActivity : Activity() {
                 }
             }
         }
+        button("Összes hibakódtípus olvasása") { readAllDtcs() }
         button("Hibakódok törlése") { prepareClear() }
+        title("Diagnosztikai jelentés")
+        diagnosticReportInfo = TextView(this).apply { text = "Még nincs készített jelentés"; textSize = 16f; root.addView(this) }
+        button("Friss diagnosztikai jelentés készítése") { createDiagnosticReport() }
+        button("Mentett jelentés megtekintése") { chooseReport("view") }
+        button("Mentett jelentés megosztása") { chooseReport("share") }
+        button("Mentett jelentés mentése fájlba") { chooseReport("save") }
+        TextView(this).apply {
+            text = "Egy kiválasztott ECU szabványos OBD-jelentése: három hibakódtípus, azonosítók, readiness és Freeze Frame. Az olvasás szünetelteti az élő mérést. A jelentés VIN-t is tartalmazhat. Nem teljes gyári szervizvizsgálat."
+            root.addView(this)
+        }
         title("Readiness, Freeze Frame, járműállapot")
         statusReport = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize = 16f; root.addView(this) }
         button("Állapot és Freeze Frame olvasása") { readStatus() }
@@ -186,6 +201,85 @@ class MainActivity : Activity() {
         errors.text = "Nincs érvényes hibakód-kiolvasás"
         statusReport.text = "Nincs érvényes állapot-kiolvasás"
         identity.text = "Nincs érvényes azonosító-kiolvasás"
+        diagnosticReportInfo.text = "Nincs folyamatban vizsgálat • ${DiagnosticReport.saved(reportsDir).size} korábbi, időbélyegzett jelentés"
+    }
+
+    private fun readAllDtcs() {
+        if (demo.isChecked) {
+            errors.text = "DEMO / SZIMULÁLT\n" + DtcScan.display(DiagnosticReport.demo(BuildConfig.VERSION_NAME).dtcs)
+            return
+        }
+        task(onAccepted = { errors.text = "VALÓDI ECU • három hibakódtípus olvasása folyamatban…" },
+            onFailure = { errors.text = "A hibakódolvasás sikertelen: $it" }) { token ->
+            val source = elm.selectedSource!!
+            val results = DtcScan({ elm.command(it) }, elm.canProtocol,
+                { token == generation.get() && elm.isConnected() }).readAll()
+            show(token) {
+                errors.text = "VALÓDI ECU: $source • friss, egymás utáni olvasások\n" + DtcScan.display(results)
+                if (results.first().state == DtcScan.State.OK) {
+                    clearState.edit().remove("clearPending").apply()
+                    status.text = "VALÓDI • ECU: $source • a tárolt hibakódok frissen kiolvasva"
+                }
+            }
+        }
+    }
+
+    private fun createDiagnosticReport() {
+        if (operation || connecting) { status.text = "Várd meg a folyamatban lévő műveletet"; return }
+        if (demo.isChecked) {
+            operation = true
+            pauseMeasurement("DEMO jelentés készítése")
+            val token = generation.get()
+            diagnosticReportInfo.text = "DEMO jelentés mentése folyamatban…"
+            worker.execute {
+                try {
+                    if (token != generation.get()) return@execute
+                    val file = DiagnosticReport.save(reportsDir, DiagnosticReport.demo(BuildConfig.VERSION_NAME))
+                    show(token) { diagnosticReportInfo.text = "DEMO / SZIMULÁLT jelentés mentve\n${file.name}" }
+                } catch (e: Exception) { show(token) { diagnosticReportInfo.text = "Jelentésmentési hiba: ${e.message}" } }
+                finally { show(token) { operation = false } }
+            }
+            return
+        }
+        task(onAccepted = { diagnosticReportInfo.text = "Friss vizsgálat folyamatban… Ez több percig is tarthat." },
+            onFailure = { diagnosticReportInfo.text = "Nem készült új jelentés: $it" }) { token ->
+            val source = elm.selectedSource!!
+            val snapshot = DiagnosticReport({ elm.command(it, 8000) }, elm.supported.toSet(), elm.canProtocol,
+                { elm.isConnected() }, { token == generation.get() }).collect(source, BuildConfig.VERSION_NAME,
+                clearState.getBoolean("clearPending", false)) { section ->
+                show(token) { diagnosticReportInfo.text = "Friss vizsgálat folyamatban…\n$section" }
+            }
+            check(token == generation.get() && elm.isConnected()) { "Megszakított vizsgálat" }
+            val file = DiagnosticReport.save(reportsDir, snapshot)
+            show(token) {
+                errors.text = "VALÓDI ECU: $source\n" + DtcScan.display(snapshot.dtcs)
+                diagnosticReportInfo.text = "VALÓDI ECU: $source • időbélyegzett jelentés mentve\n${file.name}\nA hiányzó vagy hibás adatok a jelentésben külön szerepelnek."
+            }
+        }
+    }
+
+    private fun chooseReport(action: String) {
+        if (operation || connecting) { status.text = "Várd meg a folyamatban lévő műveletet"; return }
+        val files = DiagnosticReport.saved(reportsDir).take(100)
+        if (files.isEmpty()) { diagnosticReportInfo.text = "Még nincs mentett jelentés"; return }
+        AlertDialog.Builder(this).setTitle("Korábbi diagnosztikai jelentések")
+            .setItems(files.map { it.name }.toTypedArray()) { _, index ->
+                val file = files[index]
+                try {
+                    when (action) {
+                        "share" -> startActivity(Intent.createChooser(ReportSharing.shareIntent(this, file), "Jelentés megosztása"))
+                        "save" -> {
+                            pendingReportExportName = file.name
+                            startActivityForResult(ReportSharing.saveIntent(file), 4103)
+                        }
+                        else -> {
+                            val view = TextView(this).apply { text = file.readText(Charsets.UTF_8); setPadding(24, 16, 24, 16); setTextIsSelectable(true) }
+                            AlertDialog.Builder(this).setTitle("Korábbi, időbélyegzett jelentés")
+                                .setView(ScrollView(this).apply { addView(view) }).setPositiveButton("Bezárás", null).show()
+                        }
+                    }
+                } catch (e: Exception) { diagnosticReportInfo.text = "A jelentés nem nyitható meg: ${e.message}" }
+            }.setNegativeButton("Mégsem", null).show()
     }
 
     private fun readIdentity() {
@@ -231,6 +325,7 @@ class MainActivity : Activity() {
                 errors.text = "Új vezérlő • nincs érvényes hibakód-kiolvasás"
                 statusReport.text = "Új vezérlő • nincs érvényes állapot-kiolvasás"
                 identity.text = "Új vezérlő • nincs érvényes azonosító-kiolvasás"
+                diagnosticReportInfo.text = "Új vezérlő • a mentett jelentések korábbi vizsgálatok"
                 status.text = sessionStatus("VALÓDI • kiválasztott ECU: ${sources[index]}. A cím önmagában nem azonosítja a vezérlő feladatát.")
             }.setNegativeButton("Mégsem", null).create()
         ecuDialog?.show()
@@ -462,26 +557,30 @@ class MainActivity : Activity() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("pendingExportName", pendingExportName)
+        outState.putString("pendingReportExportName", pendingReportExportName)
         super.onSaveInstanceState(outState)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != 4102) return
-        val name = pendingExportName; pendingExportName = null
-        if (resultCode != RESULT_OK || data?.data == null || name == null) { recordingInfo.text = "Fájlba mentés megszakítva"; return }
-        val file = MeasurementLog.saved(measurementsDir).firstOrNull { it.name == name }
-        if (file == null) { recordingInfo.text = "A forrásmérés már nem érhető el"; return }
+        if (requestCode !in listOf(4102, 4103)) return
+        val report = requestCode == 4103
+        val destinationInfo = if (report) diagnosticReportInfo else recordingInfo
+        val name = if (report) pendingReportExportName else pendingExportName
+        if (report) pendingReportExportName = null else pendingExportName = null
+        if (resultCode != RESULT_OK || data?.data == null || name == null) { destinationInfo.text = "Fájlba mentés megszakítva"; return }
+        val file = (if (report) DiagnosticReport.saved(reportsDir) else MeasurementLog.saved(measurementsDir)).firstOrNull { it.name == name }
+        if (file == null) { destinationInfo.text = "A forrásfájl már nem érhető el"; return }
         val uri = data.data!!
-        if (uri.scheme != "content") { recordingInfo.text = "Nem támogatott célhely"; return }
+        if (uri.scheme != "content") { destinationInfo.text = "Nem támogatott célhely"; return }
         val token = generation.get()
-        recordingInfo.text = "CSV-fájl másolása…"
+        destinationInfo.text = "Fájl másolása…"
         worker.execute {
             try {
                 val output = contentResolver.openOutputStream(uri, "wt") ?: error("A célfájl nem nyitható meg")
                 output.use { destination -> file.inputStream().use { it.copyTo(destination) }; destination.flush() }
-                show(token) { recordingInfo.text = "CSV-fájl elmentve a választott helyre:\n${file.name}" }
-            } catch (e: Exception) { show(token) { recordingInfo.text = "A fájlba mentés sikertelen: ${e.message}" } }
+                show(token) { destinationInfo.text = "Fájl elmentve a választott helyre:\n${file.name}" }
+            } catch (e: Exception) { show(token) { destinationInfo.text = "A fájlba mentés sikertelen: ${e.message}" } }
         }
     }
 
@@ -604,8 +703,10 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick)
         if (clearState.getBoolean("clearPending", false)) status.text = clearWarning()
+        diagnosticReportInfo.text = "${DiagnosticReport.saved(reportsDir).size} mentett jelentés • korábbi, időbélyegzett vizsgálatok"
         if (recording == null && !recordStartPending) refreshRecordingSummary()
     }
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
+

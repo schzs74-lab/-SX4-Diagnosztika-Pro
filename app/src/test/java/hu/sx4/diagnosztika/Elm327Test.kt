@@ -318,4 +318,36 @@ class Elm327Test {
         }
     }
 
+    @Test fun additionalDtcServicesAndReportUseSelectedResponderWithoutWrites() {
+        val commands = java.util.Collections.synchronizedList(mutableListOf<String>())
+        Adapter { cmd, socket ->
+            commands += cmd
+            val reply = when(cmd) {
+                "03" -> "7E8 04 43 01 04 20"
+                "07" -> "7E8 04 47 01 01 71"
+                "0A" -> "7E8 02 4A 00"
+                else -> null
+            }
+            if(reply == null) false else {
+                socket.getOutputStream().write((reply + "\r>").toByteArray()); socket.getOutputStream().flush(); true
+            }
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                val results = DtcScan({ elm.command(it) }, elm.canProtocol, { elm.isConnected() }).readAll()
+                assertEquals(listOf("P0420"), results[0].codes)
+                assertEquals(listOf("P0171"), results[1].codes)
+                assertEquals(DtcScan.State.OK, results[2].state)
+                assertTrue(results[2].codes.isEmpty())
+                val report = DiagnosticReport({ elm.command(it) }, elm.supported, elm.canProtocol,
+                    { elm.isConnected() }).collect(elm.selectedSource!!, "test")
+                assertEquals("7E8", report.source)
+                assertTrue(report.text().contains("P0420"))
+                assertFalse(commands.contains("04")); assertFalse(commands.any { it.startsWith("08") || it.startsWith("ATSH") })
+                assertTrue(elm.isConnected())
+            } finally { elm.close() }
+        }
+    }
 }
+
