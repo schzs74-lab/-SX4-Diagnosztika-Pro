@@ -32,17 +32,23 @@ class DriveService : Service() {
     private var recorder: DriveRecorder? = null // worker only
     private val events = ArrayDeque<DriveRecorder.Event>() // worker only
     private var notifiedAt = 0L
+    private var ownId = ""
     private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
     override fun onBind(intent: Intent?) = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == STOP) { stopSession("Felhasználói leállítás"); return START_NOT_STICKY }
+        if (finishing.get() && intent?.action == START) {
+            if (state.id == intent.getStringExtra("id")) state = state.copy(active=false, message="Az előző mérés még lezárul; indítsd újra néhány másodperc múlva")
+            stopSelf(); return START_NOT_STICKY
+        }
         if (intent?.action != START || !running.compareAndSet(false, true)) {
             if (!running.get() && !finishing.get()) stopSelf()
             return START_NOT_STICKY
         }
         val demo = intent.getBooleanExtra("demo", false)
         val id = intent.getStringExtra("id") ?: UUID.randomUUID().toString()
+        ownId = id
         state = State(id, true, demo, if(demo) "DEMO" else intent.getStringExtra("source") ?: "", SystemClock.elapsedRealtime(),
             message = "Folyamatos mérés indítása…")
         try {
@@ -127,6 +133,7 @@ class DriveService : Service() {
     }
 
     private fun publish(value: State) {
+        if (state.id != ownId) return
         state = value
         main.post {
             val now = SystemClock.elapsedRealtime()
@@ -141,11 +148,11 @@ class DriveService : Service() {
     private fun stopSession(reason: String) {
         if (!finishing.compareAndSet(false, true)) return
         running.set(false); poll?.cancel(false); elm.disconnect()
-        state = state.copy(message="Mérés lezárása… $reason")
+        if (state.id == ownId) state = state.copy(message="Mérés lezárása… $reason")
         worker.execute {
             val message = finishLog(reason)
             main.post {
-                state = state.copy(active=false, message=message)
+                if (state.id == ownId) state = state.copy(active=false, message=message)
                 releaseResources()
                 stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             }
@@ -177,9 +184,9 @@ class DriveService : Service() {
 
     override fun onDestroy() {
         running.set(false); poll?.cancel(false); elm.close()
-        if (state.active) {
+        if (state.id == ownId && state.active) {
             state = state.copy(active=false, message="A mérési szolgáltatás leállt")
-            worker.execute { val message=finishLog("A szolgáltatás leállt"); state=state.copy(message=message) }
+            worker.execute { val message=finishLog("A szolgáltatás leállt"); if(state.id == ownId) state=state.copy(message=message) }
         }
         releaseResources(); worker.shutdown(); super.onDestroy()
     }
