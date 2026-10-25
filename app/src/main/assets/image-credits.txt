@@ -1,0 +1,10 @@
+Opening screen photograph
+
+Title: Suzuki-SX4-hatch-front.jpg
+Photographer: IFCAR
+Source: https://commons.wikimedia.org/wiki/File:Suzuki-SX4-hatch-front.jpg
+Original photograph: https://upload.wikimedia.org/wikipedia/commons/8/83/Suzuki-SX4-hatch-front.jpg
+License: Released into the public domain by the photographer (PD-self).
+Adaptation: Body paint changed from red to glossy black using OpenAI ImageGen, then resized to 960 x 602 pixels and JPEG recompressed for the app.
+
+Launcher icon: isolated black first-generation Suzuki SX4, derived from the same photograph using OpenAI ImageGen. Transparent foreground, light blue background, and legacy density variants. Foreground artwork is centered inside Android's adaptive-icon safe region.

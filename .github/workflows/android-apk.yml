@@ -1,5 +1,7 @@
 name: Android APK fordítás
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
   push:
     branches: [main]
@@ -9,6 +11,14 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # Monoton növekvő versionCode: minden új APK frissítésként telepíthető a korábbira.
+      APP_BUILD_NUMBER: ${{ github.run_number }}
+      APP_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      SX4_KEYSTORE_BASE64: ${{ secrets.SX4_KEYSTORE_BASE64 }}
+      SX4_KEYSTORE_PASSWORD: ${{ secrets.SX4_KEYSTORE_PASSWORD }}
+      SX4_KEY_ALIAS: ${{ secrets.SX4_KEY_ALIAS }}
+      SX4_KEY_PASSWORD: ${{ secrets.SX4_KEY_PASSWORD }}
     steps:
       - name: Forráskód letöltése
         uses: actions/checkout@v4
@@ -28,11 +38,80 @@ jobs:
           log-accepted-android-sdk-licenses: false
       - name: Android 35 SDK telepítése
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Debug APK építése
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Állandó kulcs megkövetelése
+        shell: bash
+        run: |
+          if [ -z "$SX4_KEYSTORE_BASE64" ] || [ -z "$SX4_KEYSTORE_PASSWORD" ] || [ -z "$SX4_KEY_ALIAS" ] || [ -z "$SX4_KEY_PASSWORD" ]; then
+            echo "::error::A tesztverzióhoz az állandó aláírókulcs összes titka szükséges."
+            exit 1
+          fi
+      - name: Állandó aláírókulcs előkészítése (ha a titkok be vannak állítva)
+        if: env.SX4_KEYSTORE_BASE64 != ''
+        run: |
+          # Tolerate common copy-paste formats: wrapped lines, Windows CRLF, trailing spaces, certutil headers, URL-safe alphabet.
+          clean=$(printf '%s' "$SX4_KEYSTORE_BASE64" | sed '/^-----/d' | tr -d ' \t\r\n' | tr '_-' '/+')
+          if ! printf '%s' "$clean" | base64 --decode > "$RUNNER_TEMP/sx4-release.jks" 2>/dev/null; then
+            # Diagnostics only: length and count of foreign characters, never the secret itself.
+            bad=$(printf '%s' "$clean" | tr -d 'A-Za-z0-9+/=' | wc -c)
+            echo "::error::Az SX4_KEYSTORE_BASE64 titok nem érvényes base64 (hossz: ${#clean} karakter, ebből nem base64 karakter: ${bad}). A .jks fájl 'base64 -w0 sx4-release.jks' kimenetét másold be teljes egészében, más szöveg nélkül; egy 4096 bites kulcstár kódja jellemzően 3000–6000 karakter."
+            exit 1
+          fi
+          echo "Kulcstár: $(stat -c %s "$RUNNER_TEMP/sx4-release.jks") bájt, típus: $(file -b "$RUNNER_TEMP/sx4-release.jks" | cut -c1-60)"
+          if ! keytool -list -keystore "$RUNNER_TEMP/sx4-release.jks" -storepass "$SX4_KEYSTORE_PASSWORD" -alias "$SX4_KEY_ALIAS" > /dev/null; then
+            echo "::error::A kulcstár nem nyitható meg: ellenőrizd az SX4_KEYSTORE_PASSWORD és SX4_KEY_ALIAS titkot, illetve hogy a base64 a teljes .jks fájlból készült-e."
+            exit 1
+          fi
+          echo "SX4_KEYSTORE_FILE=$RUNNER_TEMP/sx4-release.jks" >> "$GITHUB_ENV"
+      - name: Figyelmeztetés aláírókulcs nélkül
+        if: env.SX4_KEYSTORE_BASE64 == ''
+        run: echo "::warning::Nincs SX4_KEYSTORE_BASE64 titok. A debug APK futásonként eltérő, ideiglenes kulccsal készül, ezért nem telepíthető frissítésként a korábbi APK-ra (adatvesztéssel járó eltávolítás kellene). Lásd docs/CLAUDE_AUDIT.md, 5. fejezet."
+      - name: OBD és TCP tesztek, lint, debug APK
+        run: gradle :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace
+      - name: Aláírt release APK (csak állandó kulccsal)
+        if: env.SX4_KEYSTORE_FILE != ''
+        run: gradle :app:assembleRelease --stacktrace
+      - name: Kész release APK azonosságának ellenőrzése
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="app/build/outputs/apk/release/app-release.apk"
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$tools/aapt" dump badging "$apk" > "$RUNNER_TEMP/sx4-badging.txt"
+          grep -E "^(package:|application-label:|launchable-activity:)" "$RUNNER_TEMP/sx4-badging.txt"
+          grep -q "^package: name='hu.sx4.diagnosztika.teszt'" "$RUNNER_TEMP/sx4-badging.txt"
+          "$tools/aapt" dump xmltree "$apk" AndroidManifest.xml > "$RUNNER_TEMP/sx4-manifest.txt"
+          grep -q 'android:label.*"SX4 Diagnosztika Teszt"' "$RUNNER_TEMP/sx4-manifest.txt"
+          grep -q '"hu.sx4.diagnosztika.MainActivity"' "$RUNNER_TEMP/sx4-manifest.txt"
+          "$tools/apksigner" verify --print-certs "$apk" > "$RUNNER_TEMP/sx4-signature.txt"
+          grep -qi "certificate SHA-256 digest: 75b9ae43feb7bb137062adbe60f60e34544e27983e5e2e1d7e3f342cc8f81c9f" "$RUNNER_TEMP/sx4-signature.txt"
+          echo "Csomag: hu.sx4.diagnosztika.teszt" >> "$GITHUB_STEP_SUMMARY"
+          echo "Név: SX4 Diagnosztika Teszt" >> "$GITHUB_STEP_SUMMARY"
+          echo "A release APK aláírása és a külön telepítési azonosság ellenőrizve." >> "$GITHUB_STEP_SUMMARY"
+      - name: APK-k elnevezése verzió szerint
+        run: |
+          mkdir -p dist
+          for type in debug release; do
+            dir="app/build/outputs/apk/$type"
+            [ -f "$dir/output-metadata.json" ] || continue
+            name=$(jq -r '.elements[0].versionName' "$dir/output-metadata.json")
+            file=$(jq -r '.elements[0].outputFile' "$dir/output-metadata.json")
+            cp "$dir/$file" "dist/SX4-Diagnosztika-Teszt-$name-$type.apk"
+          done
+          ls -l dist
+          [ -n "$(ls dist/*-debug.apk 2>/dev/null)" ]
+      - name: Tesztjelentések feltöltése
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SX4-test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/screenshots/
+            app/build/test-results/
+            app/build/reports/lint-results-debug.*
       - name: APK feltöltése
         uses: actions/upload-artifact@v4
         with:
-          name: SX4-Diagnosztika-Pro-debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: SX4-Diagnosztika-Teszt-APK-build${{ github.run_number }}
+          path: dist/*.apk
           if-no-files-found: error
