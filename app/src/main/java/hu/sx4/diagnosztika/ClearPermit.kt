@@ -19,3 +19,6 @@ data class ClearPermit internal constructor(
 
 class ClearOutcomeUnknown(cause: Throwable? = null) : Exception(
     "A törlés eredménye BIZONYTALAN. Csatlakozz újra, és olvasd ki a hibakódokat; ne ismételd meg automatikusan a törlést.", cause)
+
+class ClearRejected(val code: Int) : Exception("A kiválasztott ECU elutasította a törlést (NRC %02X). Nincs sikeres törlési visszaigazolás; automatikus ismétlés nem történik.".format(code))
+

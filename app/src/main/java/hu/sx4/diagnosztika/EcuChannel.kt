@@ -50,6 +50,14 @@ object EcuChannel {
         messages.size == 1 && messages.single().source == source && messages.single().data == listOf(0x44)
     } catch (_: Exception) { false }
 
+    /** Only a recognized terminal rejection from the selected sole responder is conclusive. */
+    fun clearRejectionCode(raw: String, protocol: Int, source: String): Int? = try {
+        val frames = messages(raw, "04", protocol)
+        val message = frames.singleOrNull()
+        if (message != null && message.source == source && message.data.size == 3 && message.data.take(2) == listOf(0x7F, 4))
+            message.data[2].takeIf { it in setOf(0x11, 0x12, 0x13, 0x22, 0x31, 0x33) } else null
+    } catch (_: Exception) { null }
+
     private fun hex(bytes: List<Int>) = bytes.joinToString(" ") { "%02X".format(it) }
 
     private fun j1850Crc(bytes: List<Int>): Int {
@@ -61,3 +69,4 @@ object EcuChannel {
         return crc xor 0xFF
     }
 }
+

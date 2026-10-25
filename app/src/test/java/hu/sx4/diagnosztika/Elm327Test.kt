@@ -250,7 +250,7 @@ class Elm327Test {
             "010C" -> reply(socket, if (variant == "running") "7E8 04 41 0C 0C 30" else "7E8 04 41 0C 00 00")
             "010D" -> reply(socket, if (variant == "moving") "7E8 03 41 0D 05" else "7E8 03 41 0D 00")
             "04" -> if (variant == "lostAck") { socket.close(); true }
-                else reply(socket, if (variant == "wrongAck") "7E9 01 44" else "7E8 01 44")
+                else reply(socket, when(variant) { "wrongAck" -> "7E9 01 44"; "reject" -> "7E8 03 7F 04 22"; "pendingNrc" -> "7E8 03 7F 04 78"; else -> "7E8 01 44" })
             else -> false
         }
     }
@@ -349,5 +349,27 @@ class Elm327Test {
             } finally { elm.close() }
         }
     }
+    @Test fun terminalRejectionDiffersFromResponsePendingWithoutRetry() {
+        for(variant in listOf("reject","pendingNrc")) {
+            val seen=mutableListOf<String>()
+            clearAdapter(seen,variant).use { adapter ->
+                val elm=Elm327()
+                try {
+                    adapter.connect(elm)
+                    val permit=elm.prepareClearPermit("43 01 04 20")
+                    if(variant=="reject") assertThrows(ClearRejected::class.java){elm.clearDtcs(permit)}
+                    else assertThrows(ClearOutcomeUnknown::class.java){elm.clearDtcs(permit)}
+                    assertEquals(1,seen.count{it=="04"})
+                } finally {elm.close()}
+            }
+        }
+    }
+    @Test fun ambiguousOrOtherSourceNegativeReplyIsNotConclusive() {
+        assertNull(EcuChannel.clearRejectionCode("7E9 03 7F 04 22",6,"7E8"))
+        assertNull(EcuChannel.clearRejectionCode("7E8 03 7F 04 22\r7E9 01 44",6,"7E8"))
+        assertNull(EcuChannel.clearRejectionCode("7E8 03 7F 04 78",6,"7E8"))
+        assertEquals(0x22,EcuChannel.clearRejectionCode("7E8 03 7F 04 22",6,"7E8"))
+    }
 }
+
 

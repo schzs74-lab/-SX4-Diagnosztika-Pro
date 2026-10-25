@@ -24,6 +24,9 @@ class Elm327 {
     val supported: Set<Int> get() = selection?.supported ?: emptySet()
     @Volatile private var protocolNumber = 0
     @Volatile private var session = 0L
+    @Volatile var connectionId: String = ""
+        private set
+    val protocolCode: Int get() = protocolNumber
 
     fun selectEcu(source: String) = synchronized(stateLock) {
         check(isConnected()) { "Nincs kapcsolat" }
@@ -63,12 +66,14 @@ class Elm327 {
         validate()
         permit.markDispatched()
         val response = try { exchange("04", 3500) } catch (e: Exception) { throw ClearOutcomeUnknown(e) }
+        EcuChannel.clearRejectionCode(response, protocolNumber, permit.source)?.let { throw ClearRejected(it) }
         if (!EcuChannel.clearAcknowledged(response, protocolNumber, permit.source)) throw ClearOutcomeUnknown()
     }
     private val deadlines = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "elm-deadline").apply { isDaemon = true } }
 
     fun connect(host: String, port: Int, createSocket: () -> Socket = { Socket() }, cancelled: () -> Boolean = { false }): String = synchronized(ioLock) {
         disconnect()
+        connectionId = java.util.UUID.randomUUID().toString()
         require(host.matches(Regex("(?:[0-9]{1,3}\\.){3}[0-9]{1,3}")) && host.split('.').all { it.toInt() in 0..255 }) { "IPv4-cím szükséges" }
         require(port in 1..65535) { "Hibás TCP-port" }
         val s = createSocket()
@@ -165,3 +170,4 @@ class Elm327 {
     fun isConnected() = ready && socket?.let { it.isConnected && !it.isClosed } == true
     fun close() { disconnect(); deadlines.shutdownNow() }
 }
+

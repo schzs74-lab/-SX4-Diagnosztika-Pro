@@ -40,7 +40,8 @@ class MainActivity : Activity() {
     private val ageTick = object : Runnable {
         override fun run() {
             if (!active) return
-            if (measuring && activeSequence.isNotEmpty()) renderLatest(activeSequence)
+            renderDriveState()
+            if (!DriveService.state.active && measuring && activeSequence.isNotEmpty()) renderLatest(activeSequence)
             oxygenChart.tick(SystemClock.elapsedRealtime())
             ui.postDelayed(this, 500)
         }
@@ -57,6 +58,11 @@ class MainActivity : Activity() {
     private lateinit var oxygenChart: OxygenChartView
     private lateinit var recordingInfo: TextView
     private lateinit var diagnosticReportInfo: TextView
+    private lateinit var drivingInfo: TextView
+    private var telemetry = PollingTelemetry()
+    private var driveRenderedId = ""
+    private var finishedDriveId = ""
+    private val driveLastSample = mutableMapOf<Int, Long>()
     private val recordLock = Any()
     private val recordEpoch = AtomicInteger()
     @Volatile private var recording: MeasurementLog? = null
@@ -70,7 +76,8 @@ class MainActivity : Activity() {
     /** Moving average of one poll (delay + request), the basis of each PID's stale limit. */
     @Volatile private var avgPollMs = 500L
     private val clearState by lazy { getSharedPreferences("diagnostic-state", Context.MODE_PRIVATE) }
-    private fun clearWarning(): String = "A korábbi törlés eredménye BIZONYTALAN. Csatlakozz újra, és olvasd ki a hibakódokat."
+    private val clearJournal by lazy { ClearJournal(clearState) }
+    private fun clearWarning(): String = clearJournal.warning()
     private fun sessionStatus(message: String): String =
         if (clearState.getBoolean("clearPending", false) && !message.contains("BIZONYTALAN")) clearWarning() + "\n" + message else message
     private val cm by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
@@ -88,7 +95,17 @@ class MainActivity : Activity() {
             insets
         }
         fun title(s: String) = TextView(this).apply { text = s; textSize = 22f; setTextColor(Color.rgb(20,55,72)); setPadding(0,18,0,12); root.addView(this) }
-        fun button(s: String, action: () -> Unit) = Button(this).apply { text = s; setOnClickListener { action() }; root.addView(this) }
+        fun button(s: String, action: () -> Unit) = Button(this).apply {
+            text = s
+            setOnClickListener {
+                val allowed = s in setOf("Folyamatos mérés leállítása és mentése", "Mérés leállítása", "Kapcsolat bontása",
+                    "Mentett mérés megosztása", "Mentett mérés mentése fájlba", "Mentett jelentés megtekintése",
+                    "Mentett jelentés megosztása", "Mentett jelentés mentése fájlba", "Korábbi törlési kísérlet áttekintése")
+                if (DriveService.state.active && !allowed) status.text = "Előbb állítsd le és mentsd a folyamatos mérést"
+                else action()
+            }
+            root.addView(this)
+        }
         fun field(value: String, hint: String) = EditText(this).apply { setText(value); this.hint = hint; setSingleLine(true); root.addView(this) }
         // Packaged photo: no network connection is needed on the opening screen.
         root.addView(ImageView(this).apply {
@@ -111,7 +128,7 @@ class MainActivity : Activity() {
         port = field("35000", "TCP-port").apply { inputType = 2 }
         demo = Switch(this).apply { text = "DEMO mód – szimulált adatok"; isChecked = true; root.addView(this) }
         button("Csatlakozás az adapterhez") { connectWifi() }
-        button("Kapcsolat bontása") { resetSession("Kapcsolat bontva • a korábbi adatok érvénytelenek") }
+        button("Kapcsolat bontása") { if(DriveService.state.active) stopDriving() else resetSession("Kapcsolat bontva • a korábbi adatok érvénytelenek") }
         button("Vezérlő kiválasztása") { chooseEcu() }
         title("Vezérlőazonosítás")
         identity = TextView(this).apply { text = "Azonosítók még nincsenek kiolvasva"; textSize = 16f; root.addView(this) }
@@ -124,7 +141,7 @@ class MainActivity : Activity() {
         values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
         oxygenMode = Switch(this).apply { text = "Gyors szondamérés • csak B1S1 és B1S2"; root.addView(this) }
         button("Élő adatok indítása") { startReading() }
-        button("Mérés leállítása") { pauseMeasurement("kézi leállítás") }
+        button("Mérés leállítása") { if(DriveService.state.active) stopDriving() else pauseMeasurement("kézi leállítás") }
         title("Lambdaszondák • utolsó 60 másodperc")
         oxygenChart = OxygenChartView(this).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (280*resources.displayMetrics.density).toInt())
@@ -149,6 +166,14 @@ class MainActivity : Activity() {
             latest.clear(); oxygenChart.reset()
             values.text = "Mérési mód megváltozott • indítsd újra az élő adatokat"
         }
+        title("Folyamatos mérés • kikapcsolt képernyővel is")
+        drivingInfo = TextView(this).apply { textSize = 16f; text = "Nincs folyamatos mérés"; root.addView(this) }
+        button("Folyamatos mérés és rögzítés indítása") { startDriving() }
+        button("Folyamatos mérés leállítása és mentése") { stopDriving() }
+        TextView(this).apply {
+            text = "Valódi módban előbb csatlakozz és válassz ECU-t. Az indítás új, külön mérési kapcsolatot nyit. Legfeljebb 60 percig rögzít; értesítésből is leállítható. A gyors profil a szondák mellett fordulatszámot és szabályozási állapotot is kér, ha támogatottak. Vezetés közben a telefont ne kezeld."
+            root.addView(this)
+        }
         title("Hibakód-diagnosztika")
         errors = TextView(this).apply { text = "Még nem történt kiolvasás"; textSize = 16f; root.addView(this) }
         button("Tárolt hibakódok olvasása") {
@@ -158,8 +183,8 @@ class MainActivity : Activity() {
                     onFailure = { errors.text = "A hibakód-kiolvasás sikertelen: $it" }) { token ->
                 val codes = Obd.dtcs(elm.command("03"), elm.canProtocol)
                 show(token) {
-                    clearState.edit().remove("clearPending").apply()
-                    status.text = "VALÓDI • ECU: ${elm.selectedSource} • a hibakódok frissen kiolvasva"
+                    // A fresh read is current evidence, not proof of an earlier write outcome.
+                    status.text = sessionStatus("VALÓDI • ECU: ${elm.selectedSource} • a hibakódok frissen kiolvasva")
                     errors.text = "VALÓDI ECU • tárolt hibakódok\n" + codes.ifEmpty { listOf("Nincs tárolt hibakód a sikeresen dekódolt válaszban") }.joinToString("\n")
                 }
                 }
@@ -167,6 +192,7 @@ class MainActivity : Activity() {
         }
         button("Összes hibakódtípus olvasása") { readAllDtcs() }
         button("Hibakódok törlése") { prepareClear() }
+        button("Korábbi törlési kísérlet áttekintése") { reviewClearAttempt() }
         title("Diagnosztikai jelentés")
         diagnosticReportInfo = TextView(this).apply { text = "Még nincs készített jelentés"; textSize = 16f; root.addView(this) }
         button("Friss diagnosztikai jelentés készítése") { createDiagnosticReport() }
@@ -188,6 +214,7 @@ class MainActivity : Activity() {
     }
 
     private fun resetSession(message: String) {
+        driveRenderedId = ""; driveLastSample.clear()
         generation.incrementAndGet(); measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
         stopRecording(message); oxygenChart.reset()
         connecting = false; operation = false
@@ -217,8 +244,8 @@ class MainActivity : Activity() {
             show(token) {
                 errors.text = "VALÓDI ECU: $source • friss, egymás utáni olvasások\n" + DtcScan.display(results)
                 if (results.first().state == DtcScan.State.OK) {
-                    clearState.edit().remove("clearPending").apply()
-                    status.text = "VALÓDI • ECU: $source • a tárolt hibakódok frissen kiolvasva"
+                    // A fresh read is current evidence, not proof of an earlier write outcome.
+                    status.text = sessionStatus("VALÓDI • ECU: $source • a tárolt hibakódok frissen kiolvasva")
                 }
             }
         }
@@ -389,13 +416,14 @@ class MainActivity : Activity() {
     }
 
     private fun startReading() {
-        if (measuring || operation || connecting) return
+        if (DriveService.state.active || measuring || operation || connecting) return
         val simulated = demo.isChecked
         if (!simulated && !elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
         if (!simulated && elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
         val available = if (simulated) DemoSamples.supported else elm.supported
         val sequence = if (oxygenMode.isChecked) LivePlan.oxygenSequence(available) else LivePlan.sequence(available)
         if (sequence.isEmpty()) { values.text = "Ehhez a mérési módhoz nincs támogatott PID"; return }
+        telemetry = PollingTelemetry()
         measuring = true; activeSequence = sequence; latest.clear()
         oxygenChart.start(simulated, available, SystemClock.elapsedRealtime())
         renderLatest(sequence)
@@ -414,6 +442,7 @@ class MainActivity : Activity() {
                 avgPollMs = (avgPollMs * 7 + 200 + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)) / 8
                 val at = SystemClock.elapsedRealtime()
                 if (measuring && token == generation.get() && readingToken == readingGeneration.get()) {
+                    telemetry.success(sample, at, TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started))
                     appendRecording(sample, at, token)
                     show(token) { if (measuring && readingToken == readingGeneration.get()) {
                         latest[pid] = sample.reading to at; oxygenChart.sample(sample, at); renderLatest(sequence)
@@ -421,6 +450,7 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 if (measuring && token == generation.get() && readingToken == readingGeneration.get()) {
+                    telemetry.failure(pid, SystemClock.elapsedRealtime(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started))
                     appendRecordingFailure(pid, e.message ?: "Ismeretlen hiba", SystemClock.elapsedRealtime(), token)
                     show(token) { if (measuring && readingToken == readingGeneration.get()) {
                         latest.remove(pid); oxygenChart.gap(pid)
@@ -442,7 +472,7 @@ class MainActivity : Activity() {
             val age = now - entry.second
             if (age > LivePlan.staleAfterMs(pid, sequence, avgPollMs)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
         }
-        values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + (note?.let { "\n$it" } ?: "")
+        values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + "\n" + samplingSummary(now) + (note?.let { "\n$it" } ?: "")
     }
 
     private fun startRecording() {
@@ -513,8 +543,8 @@ class MainActivity : Activity() {
     }
 
     /** Local file failures never become OBD transport failures. Called only by the polling worker. */
-    private fun appendRecording(sample: LiveSample, at: Long, token: Int) = recordRow(token) { it.append(sample, at) }
-    private fun appendRecordingFailure(pid: Int, error: String, at: Long, token: Int) = recordRow(token) { it.failure(pid, error, at) }
+    private fun appendRecording(sample: LiveSample, at: Long, token: Int) = recordRow(token) { it.append(sample, at, telemetry.metrics(sample.pid, at)) }
+    private fun appendRecordingFailure(pid: Int, error: String, at: Long, token: Int) = recordRow(token) { it.failure(pid, error, at, telemetry.metrics(pid, at)) }
     private fun recordRow(token: Int, append: (MeasurementLog) -> Boolean) {
         val target = recording ?: return
         val request = recordEpoch.get()
@@ -586,6 +616,7 @@ class MainActivity : Activity() {
 
     /** Serialize operations with single-PID polls, never queue an infinite read loop. */
     private fun task(onAccepted: () -> Unit = {}, onFailure: (String) -> Unit = {}, block: (Int) -> Unit) {
+        if (DriveService.state.active) { status.text = "Előbb állítsd le a folyamatos mérést"; return }
         if (!elm.isConnected() || demo.isChecked) { status.text = "Előbb csatlakozz valódi módban"; return }
         if (elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
         if (operation) { status.text = "Egy művelet már folyamatban van"; return }
@@ -608,6 +639,7 @@ class MainActivity : Activity() {
     }
 
     private fun prepareClear() {
+        if (clearState.getBoolean("clearPending", false)) { status.text = clearWarning(); reviewClearAttempt(); return }
         if (demo.isChecked || !elm.isConnected()) { status.text = "Törléshez valódi ECU-kapcsolat szükséges"; return }
         if (operation) { status.text = "Egy művelet már folyamatban van"; return }
         elm.clearAvailabilityReason()?.let { status.text = it; return }
@@ -670,13 +702,14 @@ class MainActivity : Activity() {
                         if (token == generation.get() && !demo.isChecked) task(onAccepted = {
                             status.text = "Törlési előfeltételek friss ellenőrzése…"
                         }) { clearToken ->
+                            var attemptId: String? = null
                             try {
                                 elm.clearDtcs(permit, onDispatch = {
-                                    check(clearState.edit().putBoolean("clearPending", true).commit()) { "A törlési kísérlet állapota nem menthető; törlés tiltva" }
+                                    attemptId = clearJournal.dispatch(permit.source, elm.protocolCode, elm.connectionId)
                                 }) { clearToken == generation.get() }
-                                clearState.edit().remove("clearPending").apply()
+                                clearJournal.finish(attemptId, "ACKNOWLEDGED")
                             } catch (e: Exception) {
-                                if (e !is ClearOutcomeUnknown) clearState.edit().remove("clearPending").apply()
+                                if (e is ClearRejected) clearJournal.finish(attemptId, "REJECTED_%02X".format(e.code))
                                 throw e
                             }
                             show(clearToken) {
@@ -699,6 +732,92 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun startDriving() {
+        if (operation || connecting || DriveService.state.active || clearDialog?.isShowing == true) {
+            status.text = "Várd meg vagy állítsd le a folyamatban lévő műveletet"; return
+        }
+        val simulated = demo.isChecked
+        if (!simulated && (!elm.isConnected() || elm.selectedSource == null)) {
+            status.text = "Előbb csatlakozz valódi módban és válassz ECU-t"; return
+        }
+        val ip = host.text.toString().trim(); val p = port.text.toString().toIntOrNull() ?: 0
+        val source = if(simulated) "DEMO" else elm.selectedSource!!
+        val oxygen = oxygenMode.isChecked
+        resetSession("Átadás a folyamatos mérésnek…")
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 74)
+            DriveService.launch(this, simulated, ip, p, source, oxygen)
+            renderDriveState()
+        } catch(e: Exception) { drivingInfo.text = "A folyamatos mérés nem indítható: ${e.message}" }
+    }
+
+    private fun stopDriving() {
+        if (!DriveService.state.active) { drivingInfo.text = "Nincs aktív folyamatos mérés"; return }
+        startService(Intent(this, DriveService::class.java).setAction(DriveService.STOP))
+        drivingInfo.text = "Folyamatos mérés lezárása és mentése…"
+    }
+
+    private fun samplingSummary(now: Long): String = listOf(20, 21).filter { it in activeSequence }.joinToString("\n") { pid ->
+        val m = telemetry.metrics(pid, now)
+        "B1S${pid-19}: ${m.hz?.let { String.format(java.util.Locale.ROOT, "%.2f minta/s", it) } ?: "még nincs elég friss minta"} • utolsó válasz ${m.requestMs} ms • ${m.errors} válaszhiba"
+    } + "\nA sebesség az utolsó 10 s sikeres mintáiból számított érték."
+
+    private fun renderDriveState() {
+        val s = DriveService.state
+        demo.isEnabled = !s.active; oxygenMode.isEnabled = !s.active; host.isEnabled = !s.active; port.isEnabled = !s.active
+        if (s.id.isEmpty() || (!s.active && finishedDriveId == s.id)) return
+        val now = SystemClock.elapsedRealtime()
+        if (s.id != driveRenderedId && s.supported.isNotEmpty()) {
+            driveRenderedId = s.id; driveLastSample.clear()
+            oxygenChart.start(s.demo, s.supported, s.startedAt)
+        }
+        for(e in s.events) if(e.atMs > (driveLastSample[e.pid] ?: -1L)) {
+            driveLastSample[e.pid] = e.atMs
+            if(e.sample != null) oxygenChart.sample(e.sample, e.atMs) else oxygenChart.gap(e.pid)
+        }
+        val rates = listOf(20,21).filter { it in s.supported }.joinToString("\n") { pid ->
+            val samples = s.events.filter { it.pid == pid && it.sample != null && now-it.atMs in 0..10_000 }
+            val hz = if(samples.size >= 2 && samples.last().atMs > samples.first().atMs)
+                String.format(java.util.Locale.ROOT, "%.2f minta/s", (samples.size-1)*1000.0/(samples.last().atMs-samples.first().atMs)) else "nincs elég friss minta"
+            val last = s.events.lastOrNull { it.pid == pid }
+            "B1S${pid-19}: $hz • utolsó válasz ${last?.metrics?.requestMs ?: 0} ms • ${last?.metrics?.errors ?: 0} válaszhiba"
+        }
+        drivingInfo.text = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU: ${s.source}") + "\n${s.message}\n$rates\nA sebesség az utolsó 10 s sikeres mintáiból számított érték."
+        if (s.active) {
+            status.text = sessionStatus("Folyamatos ${if(s.demo) "DEMO" else "VALÓDI"} mérés • ECU: ${s.source}")
+            val lastByPid = s.events.groupBy { it.pid }.values.map { it.last() }.sortedBy { it.pid }
+            values.text = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • folyamatos mérés\n" + lastByPid.joinToString("\n") { e ->
+                val age = now-e.atMs
+                if(e.sample == null) "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error)
+                else "${if(age > 5000) "ELAVULT • " else ""}${e.sample.reading} (${age} ms)"
+            } + "\nMotorállapot: " + contextLabel(s.events.lastOrNull()?.metrics)
+            recordingInfo.text = "A folyamatos mérés saját CSV-be rögzít. Leállítás után a mentett mérések között találod."
+        } else {
+            oxygenChart.pause(s.events.lastOrNull()?.atMs ?: now)
+            recordingInfo.text = s.message
+            finishedDriveId = s.id
+        }
+    }
+
+    private fun contextLabel(m: PollingTelemetry.Metrics?): String = when(m?.context) {
+        "MOTOR_ALL" -> "motor áll"
+        "MOTOR_JAR_ZART_KOR" -> "járó motor, zárt szabályozási kör"
+        "MOTOR_JAR_NYITOTT_KOR" -> "járó motor, nyitott szabályozási kör"
+        "MOTOR_JAR_VISSZACSATOLASI_HIBA" -> "visszacsatolási hiba jelzett"
+        else -> "nincs elegendő friss állapotadat"
+    }
+
+    private fun reviewClearAttempt() {
+        if (!clearState.getBoolean("clearPending", false)) { status.text = "Nincs áttekintendő bizonytalan törlési kísérlet"; return }
+        AlertDialog.Builder(this).setTitle("Korábbi bizonytalan törlési kísérlet")
+            .setMessage(clearWarning() + "\n\nA tudomásul vétel csak a figyelmeztetést zárja le. Nem igazolja a törlés sikerét; a kísérlet adatai megmaradnak.")
+            .setNegativeButton("Mégsem", null).setPositiveButton("Bizonytalan eredményt tudomásul vettem") { _, _ ->
+                try { clearJournal.acknowledgeUnknown(); status.text = "A korábbi bizonytalan kísérlet áttekintve; eredménye továbbra sem igazolt" }
+                catch(e: Exception) { status.text = "A tudomásul vétel nem menthető: ${e.message}" }
+            }.show()
+    }
+
     private fun show(token: Int, block: () -> Unit) { runOnUiThread { if (active && token == generation.get() && !isDestroyed) block() } }
     override fun onStart() {
         super.onStart(); active = true; ui.removeCallbacks(ageTick); ui.post(ageTick)
@@ -706,7 +825,8 @@ class MainActivity : Activity() {
         diagnosticReportInfo.text = "${DiagnosticReport.saved(reportsDir).size} mentett jelentés • korábbi, időbélyegzett vizsgálatok"
         if (recording == null && !recordStartPending) refreshRecordingSummary()
     }
-    override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession("Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
+    override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession(if(DriveService.state.active) "A folyamatos mérés az értesítésben tovább fut" else "Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
+
 

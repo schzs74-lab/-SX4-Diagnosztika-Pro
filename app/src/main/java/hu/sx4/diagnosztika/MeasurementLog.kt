@@ -36,17 +36,17 @@ class MeasurementLog(
         check(partial.createNewFile()) { "A mérésfájl már létezik" }
         output = FileOutputStream(partial)
         try {
-            write("\uFEFFschema,session_id,mode,ecu,polling_profile,app_version,utc_time,elapsed_ms,pid_hex,value,unit,payload_hex,reading,status\r\n")
+            write("\uFEFFschema,session_id,mode,ecu,polling_profile,app_version,utc_time,elapsed_ms,pid_hex,value,unit,payload_hex,reading,status,rate_hz,request_ms,channel_errors,rpm,rpm_age_ms,fuel_status,fuel_age_ms,context\r\n")
             output.fd.sync()
         } catch (e: Exception) { output.close(); throw e }
     }
-    fun append(sample: LiveSample, atMs: Long): Boolean = appendRow(atMs, sample.pid,
-        sample.value?.toString() ?: "", sample.unit, sample.data.joinToString(" ") { "%02X".format(it) }, sample.reading, "OK")
-    fun failure(pid: Int, message: String, atMs: Long): Boolean = appendRow(atMs, pid, "", "", "", message.take(2048), "ERROR")
-    private fun appendRow(atMs: Long, pid: Int, value: String, unit: String, bytes: String, reading: String, state: String): Boolean {
+    fun append(sample: LiveSample, atMs: Long, metrics: PollingTelemetry.Metrics? = null): Boolean = appendRow(atMs, sample.pid,
+        sample.value?.let { PollingTelemetry.decimal(it) } ?: "", sample.unit, sample.data.joinToString(" ") { "%02X".format(it) }, sample.reading, "OK", metrics)
+    fun failure(pid: Int, message: String, atMs: Long, metrics: PollingTelemetry.Metrics? = null): Boolean = appendRow(atMs, pid, "", "", "", message.take(2048), "ERROR", metrics)
+    private fun appendRow(atMs: Long, pid: Int, value: String, unit: String, bytes: String, reading: String, state: String, metrics: PollingTelemetry.Metrics?): Boolean {
         check(!closed) { "A rögzítés már lezárult" }
         require(atMs >= startedElapsedMs)
-        val row = row(atMs, "%02X".format(pid), value, unit, bytes, reading, state)
+        val row = row(atMs, "%02X".format(pid), value, unit, bytes, reading, state, metrics)
         if (rows >= maxRows || atMs - startedElapsedMs > maxDurationMs || written + row.toByteArray(Charsets.UTF_8).size + 4096 > maxBytes) {
             finish("LIMIT: idő- vagy méretkorlát", atMs)
             return false
@@ -66,11 +66,12 @@ class MeasurementLog(
         return file
     }
     fun abort() { closed = true; try { output.close() } catch (_: Exception) {} }
-    private fun row(atMs: Long, pid: String, value: String, unit: String, bytes: String, reading: String, state: String): String {
+    private fun row(atMs: Long, pid: String, value: String, unit: String, bytes: String, reading: String, state: String, metrics: PollingTelemetry.Metrics? = null): String {
         val elapsed = atMs - startedElapsedMs
         val utc = Instant.ofEpochMilli(startedUtcMs + elapsed).toString()
-        return listOf("1", id, mode, source, profile, version, utc, elapsed.toString(), pid, value, unit, bytes, reading, state)
-            .mapIndexed { index, item -> csv(item, numeric = index in setOf(0, 7, 9)) }.joinToString(",") + "\r\n"
+        return (listOf("2", id, mode, source, profile, version, utc, elapsed.toString(), pid, value, unit, bytes, reading, state) +
+            (metrics?.csv() ?: List(8) { "" }))
+            .mapIndexed { index, item -> csv(item, numeric = index in (setOf(0, 7, 9) + (14..20))) }.joinToString(",") + "\r\n"
     }
     private fun write(text: String) { val bytes = text.toByteArray(Charsets.UTF_8); output.write(bytes); written += bytes.size }
     companion object {
@@ -82,3 +83,4 @@ class MeasurementLog(
             ?.sortedByDescending { it.lastModified() } ?: emptyList()
     }
 }
+

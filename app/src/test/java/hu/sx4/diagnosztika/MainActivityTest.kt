@@ -121,4 +121,27 @@ class MainActivityTest {
         }
     }
 
+    @Test fun freshReadFromOtherEcuNeverErasesUnknownClearAttempt() {
+        val controller=Robolectric.buildActivity(MainActivity::class.java).setup()
+        try {
+            val activity=controller.get();realMode(activity)
+            val prefs=activity.getSharedPreferences("diagnostic-state",0)
+            ClearJournal(prefs).dispatch("7E8",6,"old-connection")
+            val elm=get(activity,"elm") as Elm327
+            set(elm,"socket",object:Socket(){
+                override fun isConnected()=true
+                override fun getInputStream()=java.io.ByteArrayInputStream("7E9 02 43 00\r>".toByteArray())
+                override fun getOutputStream()=java.io.ByteArrayOutputStream()
+            })
+            set(elm,"ready",true);set(elm,"canProtocol",true);set(elm,"protocolNumber",6)
+            set(elm,"ecuSources",mapOf("7E9" to setOf(12,13)));elm.selectEcu("7E9")
+            click(activity,"Tárolt hibakódok olvasása")
+            (get(activity,"worker") as ScheduledExecutorService).submit{}.get(3,TimeUnit.SECONDS)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(prefs.getBoolean("clearPending",false))
+            assertTrue(text(activity,"status").contains("7E8"))
+            assertTrue(text(activity,"errors").contains("Nincs tárolt hibakód"))
+        } finally {controller.pause().stop().destroy()}
+    }
 }
+

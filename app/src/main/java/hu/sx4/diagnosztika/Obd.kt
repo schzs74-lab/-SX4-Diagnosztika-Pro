@@ -219,6 +219,7 @@ object Obd {
     fun decodable(pid: Int) = pid in pidLength
 
     private fun fuelSystem(v: Int) = when (v) {
+        0 -> "nincs megadott aktív szabályozási állapot (00)"
         1 -> "nyitott kör (a zárt kör feltételei még nem teljesülnek)"
         2 -> "zárt kör (lambdaszabályozás)"
         4 -> "nyitott kör (terhelés vagy motorfék miatt)"
@@ -285,3 +286,4 @@ object Obd {
         return null
     }
 }
+
