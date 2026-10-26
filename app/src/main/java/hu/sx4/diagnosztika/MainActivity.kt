@@ -46,6 +46,7 @@ class MainActivity : Activity() {
             ui.postDelayed(this, 500)
         }
     }
+    private lateinit var dashboard: DashboardUi
     private lateinit var status: TextView
     private lateinit var values: TextView
     private lateinit var errors: TextView
@@ -89,15 +90,18 @@ class MainActivity : Activity() {
         pendingExportName = savedInstanceState?.getString("pendingExportName")
         pendingExportHungarian = savedInstanceState?.getBoolean("pendingExportHungarian") ?: false
         pendingReportExportName = savedInstanceState?.getString("pendingReportExportName")
-        val scroll = ScrollView(this)
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 30, 28, 30) }
-        scroll.addView(root); setContentView(scroll)
-        root.setOnApplyWindowInsetsListener { view, insets ->
-            view.setPadding(28 + insets.systemWindowInsetLeft, 30 + insets.systemWindowInsetTop,
-                28 + insets.systemWindowInsetRight, 30 + insets.systemWindowInsetBottom)
-            insets
+        dashboard = DashboardUi(this)
+        status = dashboard.status
+        var root = dashboard.card(0, "Az autód", "Suzuki SX4 • 2007 • 1.5 benzin")
+        fun title(s: String) {
+            val page = when(s) {
+                "Kapcsolódás", "Vezérlőazonosítás" -> 0
+                "Élő motoradatok", "Lambdaszondák • utolsó 60 másodperc", "Mérés rögzítése", "Folyamatos mérés • kikapcsolt képernyővel is" -> 1
+                "Mérésmentés • CSV", "Diagnosztikai jelentés" -> 2
+                else -> 3
+            }
+            root = dashboard.card(page, s)
         }
-        fun title(s: String) = TextView(this).apply { text = s; textSize = 22f; setTextColor(Color.rgb(20,55,72)); setPadding(0,18,0,12); root.addView(this) }
         fun button(s: String, action: () -> Unit) = Button(this).apply {
             text = s
             setOnClickListener {
@@ -116,18 +120,23 @@ class MainActivity : Activity() {
             contentDescription = "Fekete, első generációs Suzuki SX4"
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
-            maxHeight = (220 * resources.displayMetrics.density).toInt()
+            maxHeight = (140 * resources.displayMetrics.density).toInt()
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         })
-        title("SX4 Diagnosztika Teszt")
         TextView(this).apply {
             text = "Külön telepített tesztváltozat\nMegadott profil: Suzuki SX4 2007 • 1.5 benzin • v${BuildConfig.VERSION_NAME} (versionCode ${BuildConfig.VERSION_CODE})\n" +
                 "Build ${BuildConfig.BUILD_NUMBER} • commit ${BuildConfig.GIT_SHA} • ${BuildConfig.BUILD_TYPE}"
             root.addView(this)
         }
-        status = TextView(this).apply { text = "DEMO mód • nincs ECU-kapcsolat"; textSize = 17f; root.addView(this) }
+        title("Kapcsolódás")
+        TextView(this).apply {
+            text = "1. Csatlakozz az adapter Wi-Fi-hálózatához.\n2. Kapcsold ki a DEMO módot.\n3. Csatlakozz, majd válassz vezérlőt."
+            root.addView(this)
+        }
+        TextView(this).apply { text = "Adapter IP-címe"; root.addView(this) }
         host = field("192.168.0.10", "Adapter IPv4-címe")
+        TextView(this).apply { text = "TCP-port"; root.addView(this) }
         port = field("35000", "TCP-port").apply { inputType = 2 }
         demo = Switch(this).apply { text = "DEMO mód – szimulált adatok"; isChecked = true; root.addView(this) }
         button("Csatlakozás az adapterhez") { connectWifi() }
@@ -154,10 +163,21 @@ class MainActivity : Activity() {
             text = "A szondák eltérő időpontban frissülnek. A pontok valódi minták; 5 másodpercnél nagyobb adathiány megszakítja a görbét. A grafikon önmagában nem katalizátorteszt."
             root.addView(this)
         }
-        title("Mérésmentés • CSV")
+        title("Mérés rögzítése")
         recordingInfo = TextView(this).apply { text = "Nincs aktív rögzítés"; textSize = 16f; root.addView(this) }
         button("Rögzítés indítása") { startRecording() }
         button("Rögzítés lezárása és mentése") { stopRecording("kézi mentés") }
+        title("Mérésmentés • CSV")
+        val savedRecordingInfo = TextView(this).apply { text = recordingInfo.text; root.addView(this) }
+        recordingInfo.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { savedRecordingInfo.text = s }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+        TextView(this).apply {
+            text = "A korábban rögzített méréseket itt mentheted vagy oszthatod meg. Excelhez válaszd a Magyar Excel formátumot a mentéskor."
+            root.addView(this)
+        }
         button("Mentett mérés megosztása") { chooseMeasurement(share = true) }
         button("Mentett mérés mentése fájlba") { chooseMeasurement(share = false) }
         TextView(this).apply {
@@ -214,6 +234,7 @@ class MainActivity : Activity() {
             setPadding(0,24,0,20); root.addView(this)
         }
         demo.setOnCheckedChangeListener { _, checked -> resetSession(if (checked) "DEMO mód • nincs ECU-kapcsolat" else "VALÓDI mód • előbb csatlakozz") }
+        dashboard.finish(savedInstanceState)
     }
 
     private fun resetSession(message: String) {
@@ -599,6 +620,7 @@ class MainActivity : Activity() {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
+        dashboard.save(outState)
         outState.putString("pendingExportName", pendingExportName)
         outState.putBoolean("pendingExportHungarian", pendingExportHungarian)
         outState.putString("pendingReportExportName", pendingReportExportName)
@@ -845,6 +867,7 @@ class MainActivity : Activity() {
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession(if(DriveService.state.active) "A folyamatos mérés az értesítésben tovább fut" else "Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
+
 
 
 
