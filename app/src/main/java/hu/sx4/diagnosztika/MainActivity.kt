@@ -68,6 +68,8 @@ class MainActivity : Activity() {
     @Volatile private var recording: MeasurementLog? = null
     private var recordStartPending = false
     private var pendingExportName: String? = null
+    /** Export copy converted for Hungarian spreadsheet settings; the stored measurement stays unchanged. */
+    private var pendingExportHungarian = false
     private var pendingReportExportName: String? = null
     private val reportsDir get() = File(filesDir, "reports")
     private val measurementsDir get() = File(filesDir, "measurements")
@@ -85,6 +87,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingExportName = savedInstanceState?.getString("pendingExportName")
+        pendingExportHungarian = savedInstanceState?.getBoolean("pendingExportHungarian") ?: false
         pendingReportExportName = savedInstanceState?.getString("pendingReportExportName")
         val scroll = ScrollView(this)
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(28, 30, 28, 30) }
@@ -577,16 +580,36 @@ class MainActivity : Activity() {
                 try {
                     val file = files[index]
                     if (share) startActivity(Intent.createChooser(MeasurementSharing.shareIntent(this, file), "Mérés megosztása"))
-                    else {
-                        pendingExportName = file.name
-                        startActivityForResult(MeasurementSharing.saveIntent(file), 4102)
-                    }
+                    else chooseExportFormat(file)
                 } catch (e: Exception) { recordingInfo.text = "A fájlművelet nem indítható: ${e.message}" }
             }.setNegativeButton("Mégsem", null).show()
     }
 
+    private fun chooseExportFormat(file: File) {
+        AlertDialog.Builder(this).setTitle("Milyen formátumban mented?")
+            .setItems(arrayOf("Szabványos CSV (vessző, tizedespont) • programokhoz",
+                "Magyar Excel (pontosvessző, tizedesvessző)")) { _, index ->
+                try {
+                    pendingExportName = file.name
+                    pendingExportHungarian = index == 1
+                    val title = if (pendingExportHungarian) CsvExport.hungarianName(file.name) else file.name
+                    startActivityForResult(MeasurementSharing.saveIntent(file, title), 4102)
+                } catch (e: Exception) { recordingInfo.text = "A fájlművelet nem indítható: ${e.message}" }
+            }.setNegativeButton("Mégsem", null).show()
+    }
+
+    /** Some document providers reject truncate mode; a freshly created document is empty, so plain write is equivalent. */
+    private fun openDestination(uri: android.net.Uri): java.io.OutputStream {
+        val truncating = try { contentResolver.openOutputStream(uri, "wt") }
+            catch (_: java.io.FileNotFoundException) { null }
+            catch (_: IllegalArgumentException) { null }
+            catch (_: UnsupportedOperationException) { null }
+        return truncating ?: contentResolver.openOutputStream(uri, "w") ?: error("A célfájl nem nyitható meg")
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("pendingExportName", pendingExportName)
+        outState.putBoolean("pendingExportHungarian", pendingExportHungarian)
         outState.putString("pendingReportExportName", pendingReportExportName)
         super.onSaveInstanceState(outState)
     }
@@ -597,7 +620,8 @@ class MainActivity : Activity() {
         val report = requestCode == 4103
         val destinationInfo = if (report) diagnosticReportInfo else recordingInfo
         val name = if (report) pendingReportExportName else pendingExportName
-        if (report) pendingReportExportName = null else pendingExportName = null
+        val hungarian = !report && pendingExportHungarian
+        if (report) pendingReportExportName = null else { pendingExportName = null; pendingExportHungarian = false }
         if (resultCode != RESULT_OK || data?.data == null || name == null) { destinationInfo.text = "Fájlba mentés megszakítva"; return }
         val file = (if (report) DiagnosticReport.saved(reportsDir) else MeasurementLog.saved(measurementsDir)).firstOrNull { it.name == name }
         if (file == null) { destinationInfo.text = "A forrásfájl már nem érhető el"; return }
@@ -607,9 +631,13 @@ class MainActivity : Activity() {
         destinationInfo.text = "Fájl másolása…"
         worker.execute {
             try {
-                val output = contentResolver.openOutputStream(uri, "wt") ?: error("A célfájl nem nyitható meg")
-                output.use { destination -> file.inputStream().use { it.copyTo(destination) }; destination.flush() }
-                show(token) { destinationInfo.text = "Fájl elmentve a választott helyre:\n${file.name}" }
+                // Convert before opening the destination, so a malformed source never leaves a truncated target.
+                val converted = if (hungarian) CsvExport.toHungarianExcel(file.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8) else null
+                openDestination(uri).use { destination ->
+                    if (converted != null) destination.write(converted) else file.inputStream().use { it.copyTo(destination) }
+                    destination.flush()
+                }
+                show(token) { destinationInfo.text = "Fájl elmentve a választott helyre" + (if (hungarian) " (magyar Excel-formátum)" else "") + ":\n${file.name}" }
             } catch (e: Exception) { show(token) { destinationInfo.text = "A fájlba mentés sikertelen: ${e.message}" } }
         }
     }

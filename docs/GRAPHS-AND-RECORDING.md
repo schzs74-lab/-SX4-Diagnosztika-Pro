@@ -35,3 +35,14 @@ Regression tests cover independent timestamped traces, gaps/window bounds, numer
 Phone testing of graph appearance, actual sampling rate, CSV opening in target apps and the Android 16 document/share pickers remains necessary. The previously supplied screenshots verify basic build25 OBD reads on this user's vehicle; they do not verify these newly added features.
 
 References: https://developer.android.com/reference/androidx/core/content/FileProvider and https://developer.android.com/training/data-storage/shared/documents-files
+
+## Export for Hungarian spreadsheet settings
+
+**Mentett mérés mentése fájlba** now asks for the format of the exported copy:
+
+- **Szabványos CSV** – byte-exact copy of the stored file (comma separator, decimal point), for programs and scripts.
+- **Magyar Excel** – a converted copy named `…-excel-hu.csv`: semicolon separator and decimal comma, as expected by spreadsheet programs with Hungarian regional settings. Only the numeric measurement columns (schema, elapsed_ms, value, rate_hz, request_ms, channel_errors, rpm, rpm_age_ms, fuel_status, fuel_age_ms) get a decimal comma; text such as decoded readings, UTC time and payload bytes is unchanged. Column detection uses the header, so older schema 1 recordings convert too. UTF-8 BOM, quoting and formula protection are retained.
+
+The stored measurement is never modified; sharing still sends the standard file. The conversion runs completely before the destination is opened, so a malformed source cannot leave a truncated target file. If a document provider rejects the truncating `"wt"` write mode, the app falls back to `"w"`, which is equivalent for the freshly created empty document.
+
+Tests: `CsvExportTest` (JVM) covers numeric/text column handling, separators, quotes and line breaks inside fields, schema 1 input and malformed input; `ExportUiTest` (Robolectric) covers the converted and byte-exact exports through the activity result path and format persistence across recreation. Opening the converted file in a spreadsheet program on the phone or PC remains a manual check.
