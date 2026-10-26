@@ -98,7 +98,7 @@ class ExportUiTest {
             file.writeText(file.readText().replaceFirst("\"2\",","\"2\"x,"))
             val uri=Uri.parse("content://test.exports/file")
             val provider=ExportDestinationTest.Provider().apply {
-                file=File(activity.cacheDir,"untouched.csv").apply{writeText("KEEP")}
+                this.file=File(activity.cacheDir,"untouched.csv").apply{writeText("KEEP")}
                 attachInfo(activity,android.content.pm.ProviderInfo().apply{authority="test.exports";exported=true})
             }
             org.robolectric.shadows.ShadowContentResolver.registerProviderInternal("test.exports",provider)
