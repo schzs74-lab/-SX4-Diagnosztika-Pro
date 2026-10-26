@@ -17,7 +17,7 @@ object MeasurementSharing {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }
-    fun saveIntent(file: File): Intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-        addCategory(Intent.CATEGORY_OPENABLE); type = "text/csv"; putExtra(Intent.EXTRA_TITLE, file.name)
+    fun saveIntent(file: File, title: String = file.name): Intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE); type = "text/csv"; putExtra(Intent.EXTRA_TITLE, title)
     }
 }

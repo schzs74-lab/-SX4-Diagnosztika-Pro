@@ -35,3 +35,21 @@ Regression tests cover independent timestamped traces, gaps/window bounds, numer
 Phone testing of graph appearance, actual sampling rate, CSV opening in target apps and the Android 16 document/share pickers remains necessary. The previously supplied screenshots verify basic build25 OBD reads on this user's vehicle; they do not verify these newly added features.
 
 References: https://developer.android.com/reference/androidx/core/content/FileProvider and https://developer.android.com/training/data-storage/shared/documents-files
+
+## Export for Hungarian spreadsheet settings
+
+**Mentett mérés mentése fájlba** now asks for the format of the exported copy:
+
+- **Szabványos CSV** – byte-exact copy of the stored file (comma separator, decimal point), for programs and scripts.
+- **Magyar Excel** – a converted copy named `…-excel-hu.csv`: semicolon separator and decimal comma, as expected by spreadsheet programs with Hungarian regional settings. Only the numeric measurement columns (schema, elapsed_ms, value, rate_hz, request_ms, channel_errors, rpm, rpm_age_ms, fuel_status, fuel_age_ms) get a decimal comma; text such as decoded readings, UTC time and payload bytes is unchanged. Column detection uses the header, so older schema 1 recordings convert too. UTF-8 BOM, quoting and formula protection are retained.
+
+The stored measurement is never modified; sharing still sends the standard file. Both export variants are first streamed to a unique private cache file. The Hungarian converter validates CSV syntax, unique known schema 1/2 headers, record widths, schema versions, UTF-8 and numeric values. Closing quotes may only be followed by a separator, record ending or EOF. Bare CR outside quoted fields is rejected; CR/LF inside quoted fields are preserved, and LF record endings are supported. Old scientific notation is converted using bounded BigDecimal formatting. Text, including existing protective apostrophes, is preserved.
+
+Production export never loads the whole source/parsed table/result into memory. Only one bounded record is processed at a time. Limits are 10 MiB input, 32 MiB staged output, 16,384 characters per field, 128 columns, 100,002 records and bounded decimal precision/scale. Completed staging is synced before the destination is opened; failure or completion removes the temporary file. The cache is outside FileProvider sharing roots. The system picker may already have created an empty document before conversion; the app does not claim to prevent that.
+
+If the provider rejects `"wt"` with FileNotFoundException, IllegalArgumentException or UnsupportedOperationException (or returns null), fallback opens a `"w"` descriptor and explicitly truncates/seeks it before writing, then verifies its final length. A descriptor that cannot be safely truncated is rejected; an existing tail is never accepted as a successful fallback. Security/general I/O failures are not retried, and interrupted writes are never retried. Non-seekable providers must support the explicit `"wt"` path; otherwise export reports a compatibility error rather than risking corrupted output.
+
+Tests: `CsvExportTest` covers numeric/text columns, quotes/newlines/empty fields, strict malformed-input rejection, schema 1 scientific notation, schema/header/width validation, pathological numbers, strict UTF-8, private staging/cleanup and a large streamed recording. `ExportUiTest` runs at API28/API35 and actually destroys/recreates the activity before delivering CSV/report picker results; it covers both formats, cancellation, malformed sources and cleanup. `ExportDestinationTest` uses a custom ContentProvider at API28/API35 to exercise unsupported modes, nonempty non-truncating targets, unusable descriptors and permission/I/O failures. Robolectric models pipes as ordinary files, so a true non-seekable provider still requires device testing. Opening the result in Hungarian Excel and Android16 document providers remains a manual check.
+
+The CI pull_request filter includes the test target branch, so PR #5 updates receive automatic checks as well as main-targeted PRs.
+
