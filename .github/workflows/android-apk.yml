@@ -1,7 +1,7 @@
 name: Android APK fordítás
 on:
   pull_request:
-    branches: [main]
+    branches: [main, codex/sx4-side-by-side-test]
   workflow_dispatch:
   push:
     branches: [main]
@@ -115,3 +115,4 @@ jobs:
           name: SX4-Diagnosztika-Teszt-APK-build${{ github.run_number }}
           path: dist/*.apk
           if-no-files-found: error
+

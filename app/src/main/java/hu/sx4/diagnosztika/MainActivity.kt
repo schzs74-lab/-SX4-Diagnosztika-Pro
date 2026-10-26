@@ -598,15 +598,6 @@ class MainActivity : Activity() {
             }.setNegativeButton("Mégsem", null).show()
     }
 
-    /** Some document providers reject truncate mode; a freshly created document is empty, so plain write is equivalent. */
-    private fun openDestination(uri: android.net.Uri): java.io.OutputStream {
-        val truncating = try { contentResolver.openOutputStream(uri, "wt") }
-            catch (_: java.io.FileNotFoundException) { null }
-            catch (_: IllegalArgumentException) { null }
-            catch (_: UnsupportedOperationException) { null }
-        return truncating ?: contentResolver.openOutputStream(uri, "w") ?: error("A célfájl nem nyitható meg")
-    }
-
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("pendingExportName", pendingExportName)
         outState.putBoolean("pendingExportHungarian", pendingExportHungarian)
@@ -631,11 +622,9 @@ class MainActivity : Activity() {
         destinationInfo.text = "Fájl másolása…"
         worker.execute {
             try {
-                // Convert before opening the destination, so a malformed source never leaves a truncated target.
-                val converted = if (hungarian) CsvExport.toHungarianExcel(file.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8) else null
-                openDestination(uri).use { destination ->
-                    if (converted != null) destination.write(converted) else file.inputStream().use { it.copyTo(destination) }
-                    destination.flush()
+                // Stage and validate completely with bounded memory before opening the chosen URI.
+                CsvExport.prepare(file, cacheDir, hungarian).use { prepared ->
+                    ExportDestination.copy(contentResolver, uri, prepared.file)
                 }
                 show(token) { destinationInfo.text = "Fájl elmentve a választott helyre" + (if (hungarian) " (magyar Excel-formátum)" else "") + ":\n${file.name}" }
             } catch (e: Exception) { show(token) { destinationInfo.text = "A fájlba mentés sikertelen: ${e.message}" } }
@@ -856,5 +845,6 @@ class MainActivity : Activity() {
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession(if(DriveService.state.active) "A folyamatos mérés az értesítésben tovább fut" else "Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
+
 
 

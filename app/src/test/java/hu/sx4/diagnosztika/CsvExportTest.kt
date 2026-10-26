@@ -59,4 +59,77 @@ class CsvExportTest {
     @Test fun exportNameIsDistinctFromTheStandardCopy() {
         assertEquals("sx4-real-20261026-101500-id-excel-hu.csv", CsvExport.hungarianName("sx4-real-20261026-101500-id.csv"))
     }
+
+    @Test fun quotedFieldsAndEmptyRecordsFollowTheLexerRules() {
+        assertEquals(listOf(listOf("a,b", "a\"b", "a\r\nb", "a\nb", "a\rb", "", "")),
+            CsvExport.parse("\"a,b\",\"a\"\"b\",\"a\r\nb\",\"a\nb\",\"a\rb\",,\"\"\r\n"))
+        assertEquals(listOf(listOf("", "", "")), CsvExport.parse(",,\n"))
+        assertEquals(listOf(listOf("")), CsvExport.parse("\"\""))
+        assertEquals(listOf(listOf("a","b"),listOf("c","d")), CsvExport.parse("a,b\nc,d"))
+        for(input in listOf("\"a\"x,b\r\n", "\"a\" ,b\r\n", "a\rb,c\r\n", "\"a\"\rb,c\r\n", "a\"b,c", "\"unclosed"))
+            assertThrows(input,IllegalArgumentException::class.java) { CsvExport.parse(input) }
+    }
+
+    private val legacyHeader = "schema,session_id,mode,ecu,polling_profile,app_version,utc_time,elapsed_ms,pid_hex,value,unit,payload_hex,reading,status"
+    private fun legacyRow(value: String) = "1,id,REAL,7E8,ALL_LIVE_PIDS,b27,1970-01-01T00:00:00.001Z,1,24,$value,lambda,00 01 00 00,lambda 0.000,OK"
+
+    @Test fun oldScientificValuesAreLocalizedWithoutTouchingText() {
+        for((number,expected) in listOf("3.0517578125E-5" to "0,000030517578125", "-3.0517578125E-5" to "-0,000030517578125", "1.25E+3" to "1250")) {
+            val rows=CsvExport.parse(CsvExport.toHungarianExcel("$legacyHeader\r\n${legacyRow(number)}\r\n"),';')
+            assertEquals(expected,rows[1][9]);assertEquals("lambda 0.000",rows[1][12])
+            assertEquals("1970-01-01T00:00:00.001Z",rows[1][6]);assertEquals("00 01 00 00",rows[1][11])
+        }
+    }
+
+    @Test fun missingExtraDuplicateAndWrongSchemaFieldsAreRejected() {
+        for(input in listOf("schema,value\r\n1,0.4\r\n", "$legacyHeader\r\n1\r\n", "$legacyHeader\r\n${legacyRow("0.4")},extra\r\n",
+            legacyHeader.replace("mode","schema")+"\r\n", "$legacyHeader\r\n${legacyRow("0.4").replaceFirst("1,","2,")}\r\n"))
+            assertThrows(IllegalArgumentException::class.java) { CsvExport.toHungarianExcel(input) }
+    }
+
+    @Test fun extremeExponentsAndOversizedFieldsFailBeforeUnboundedExpansion() {
+        for(number in listOf("1E-2147483648","1E+2147483647","1E-129","NaN","=1+1"))
+            assertThrows(IllegalArgumentException::class.java) { CsvExport.toHungarianExcel("$legacyHeader\r\n${legacyRow(number)}\r\n") }
+        assertThrows(IllegalArgumentException::class.java) { CsvExport.parse("\""+"x".repeat(16_385)+"\"") }
+    }
+
+    @Test fun stagingIsPrivateByteExactForStandardAndRemovedOnClose() {
+        val dir=Files.createTempDirectory("sx4-stage").toFile()
+        try {
+            val source=java.io.File(dir,"source.csv").apply { writeBytes(byteArrayOf(0xEF.toByte(),0xBB.toByte(),0xBF.toByte(),0,13,10,65)) }
+            var staged:java.io.File?=null
+            CsvExport.prepare(source,java.io.File(dir,"cache"),false).use { prepared ->
+                staged=prepared.file;assertArrayEquals(source.readBytes(),prepared.file.readBytes());assertTrue(prepared.file.name.endsWith(".part"))
+                assertNotEquals(source.parentFile,prepared.file.parentFile)
+            }
+            assertFalse(staged!!.exists());assertEquals(7,source.length().toInt())
+        } finally {dir.deleteRecursively()}
+    }
+
+    @Test fun invalidUtf8AndMalformedSourceLeaveNoStagedExport() {
+        val dir=Files.createTempDirectory("sx4-stage-error").toFile()
+        try {
+            val source=java.io.File(dir,"source.csv");val cache=java.io.File(dir,"cache")
+            source.writeText("$legacyHeader\r\n\"1\"x,bad\r\n")
+            assertThrows(IllegalArgumentException::class.java) { CsvExport.prepare(source,cache,true) }
+            source.writeBytes(byteArrayOf(0xC3.toByte(),0x28))
+            assertThrows(java.nio.charset.CharacterCodingException::class.java) { CsvExport.prepare(source,cache,true) }
+            assertTrue(java.io.File(cache,"csv-export").listFiles()!!.isEmpty())
+        } finally {dir.deleteRecursively()}
+    }
+
+    @Test fun largeRecordingIsPreparedByStreamingAndKeepsAllRows() {
+        val dir=Files.createTempDirectory("sx4-stage-large").toFile()
+        try {
+            val log=MeasurementLog(dir,"REAL","7E8","CONTINUOUS_OXYGEN_WITH_CONTEXT","test",0,0)
+            val sample=LiveSample.decode(20,listOf(83,128));val metrics=PollingTelemetry.Metrics(1.75,42,0,780.5,120,2,300,"MOTOR_JAR_ZART_KOR")
+            repeat(30_000) { assertTrue(log.append(sample,it.toLong(),metrics)) }
+            val source=log.finish("stop",30_000)
+            CsvExport.prepare(source,java.io.File(dir,"cache"),true).use { prepared ->
+                assertEquals(30_002,prepared.file.bufferedReader().use { it.lineSequence().count() })
+                prepared.file.inputStream().use { assertEquals(0xEF,it.read());assertEquals(0xBB,it.read());assertEquals(0xBF,it.read()) }
+            }
+        } finally {dir.deleteRecursively()}
+    }
 }
+
