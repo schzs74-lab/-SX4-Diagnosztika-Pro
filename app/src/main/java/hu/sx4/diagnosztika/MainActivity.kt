@@ -42,11 +42,14 @@ class MainActivity : Activity() {
             if (!active) return
             renderDriveState()
             if (!DriveService.state.active && measuring && activeSequence.isNotEmpty()) renderLatest(activeSequence)
+            refreshLights()
             oxygenChart.tick(SystemClock.elapsedRealtime())
             ui.postDelayed(this, 500)
         }
     }
     private lateinit var dashboard: DashboardUi
+    private lateinit var instruments: InstrumentPanel
+    private lateinit var gaugeInfo: TextView
     private lateinit var status: TextView
     private lateinit var values: TextView
     private lateinit var errors: TextView
@@ -76,6 +79,9 @@ class MainActivity : Activity() {
     private val measurementsDir get() = File(filesDir, "measurements")
     /** Latest decoded line per PID with its receive time; read and written on the UI thread only. */
     private val latest = LinkedHashMap<Int, Pair<String, Long>>()
+    /** Numeric value of the same samples for the instruments; null for status/bit-field PIDs. UI thread only. */
+    private val latestValues = HashMap<Int, Pair<Double?, Long>>()
+    private var activeSupported: Set<Int> = emptySet()
     /** Moving average of one poll (delay + request), the basis of each PID's stale limit. */
     @Volatile private var avgPollMs = 500L
     private val clearState by lazy { getSharedPreferences("diagnostic-state", Context.MODE_PRIVATE) }
@@ -97,6 +103,7 @@ class MainActivity : Activity() {
             val page = when(s) {
                 "Kapcsolódás", "Vezérlőazonosítás" -> 0
                 "Élő motoradatok", "Lambdaszondák • utolsó 60 másodperc", "Mérés rögzítése", "Folyamatos mérés • kikapcsolt képernyővel is" -> 1
+                "Műszerfal vezérlése" -> DashboardUi.GAUGES
                 "Mérésmentés • CSV", "Diagnosztikai jelentés" -> 2
                 else -> 3
             }
@@ -105,7 +112,7 @@ class MainActivity : Activity() {
         fun button(s: String, action: () -> Unit) = Button(this).apply {
             text = s
             setOnClickListener {
-                val allowed = s in setOf("Folyamatos mérés leállítása és mentése", "Mérés leállítása", "Kapcsolat bontása",
+                val allowed = s in setOf("Folyamatos mérés leállítása és mentése", "Mérés leállítása", "Műszerfal leállítása", "Kapcsolat bontása",
                     "Mentett mérés megosztása", "Mentett mérés mentése fájlba", "Mentett jelentés megtekintése",
                     "Mentett jelentés megosztása", "Mentett jelentés mentése fájlba", "Korábbi törlési kísérlet áttekintése")
                 if (DriveService.state.active && !allowed) status.text = "Előbb állítsd le és mentsd a folyamatos mérést"
@@ -154,6 +161,15 @@ class MainActivity : Activity() {
         oxygenMode = Switch(this).apply { text = "Gyors szondamérés • csak B1S1 és B1S2"; root.addView(this) }
         button("Élő adatok indítása") { startReading() }
         button("Mérés leállítása") { if(DriveService.state.active) stopDriving() else pauseMeasurement("kézi leállítás") }
+        instruments = InstrumentPanel(this)
+        dashboard.add(DashboardUi.GAUGES, instruments)
+        title("Műszerfal vezérlése")
+        gaugeInfo = TextView(this).apply {
+            text = "Lapozz oldalra a két műszeroldal között. Az óra csak friss, valódi mintát mutat; mutató nélkül nincs érvényes adat."
+            root.addView(this)
+        }
+        button("Műszerfal indítása") { startReading() }
+        button("Műszerfal leállítása") { if(DriveService.state.active) stopDriving() else pauseMeasurement("kézi leállítás") }
         title("Lambdaszondák • utolsó 60 másodperc")
         oxygenChart = OxygenChartView(this).apply {
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (280*resources.displayMetrics.density).toInt())
@@ -186,7 +202,7 @@ class MainActivity : Activity() {
         }
         oxygenMode.setOnCheckedChangeListener { _, _ ->
             pauseMeasurement("mérési mód váltása")
-            latest.clear(); oxygenChart.reset()
+            latest.clear(); latestValues.clear(); instruments.clear(); oxygenChart.reset()
             values.text = "Mérési mód megváltozott • indítsd újra az élő adatokat"
         }
         title("Folyamatos mérés • kikapcsolt képernyővel is")
@@ -234,13 +250,29 @@ class MainActivity : Activity() {
             setPadding(0,24,0,20); root.addView(this)
         }
         demo.setOnCheckedChangeListener { _, checked -> resetSession(if (checked) "DEMO mód • nincs ECU-kapcsolat" else "VALÓDI mód • előbb csatlakozz") }
+        status.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) { refreshLights() }
+        })
         dashboard.finish(savedInstanceState)
+        refreshLights()
+    }
+
+    /** Main-menu indicators reflect the session state only; they never trigger a connection. */
+    private fun refreshLights() {
+        val drive = DriveService.state
+        val realDrive = drive.active && !drive.demo
+        val adapter = !demo.isChecked && elm.isConnected()
+        dashboard.showLights(wifi = realDrive || networkCallback != null, adapter = realDrive || adapter,
+            ecu = realDrive || (adapter && elm.selectedSource != null), recording = drive.active || recording != null)
     }
 
     private fun resetSession(message: String) {
         driveRenderedId = ""; driveLastSample.clear()
         generation.incrementAndGet(); measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
         stopRecording(message); oxygenChart.reset()
+        latestValues.clear(); instruments.clear()
         connecting = false; operation = false
         clearDialog?.dismiss(); clearDialog = null
         ecuDialog?.dismiss(); ecuDialog = null
@@ -371,7 +403,7 @@ class MainActivity : Activity() {
                 pauseMeasurement("vezérlőváltás")
                 oxygenChart.reset()
                 elm.selectEcu(sources[index])
-                latest.clear()
+                latest.clear(); latestValues.clear(); instruments.clear()
                 values.text = "Új vezérlő • nincs érvényes mérés"
                 errors.text = "Új vezérlő • nincs érvényes hibakód-kiolvasás"
                 statusReport.text = "Új vezérlő • nincs érvényes állapot-kiolvasás"
@@ -387,6 +419,7 @@ class MainActivity : Activity() {
         if (!measuring) return
         measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
         oxygenChart.pause(SystemClock.elapsedRealtime())
+        latestValues.clear(); instruments.clear()
         values.text = "Mérés szünetel: $reason • a korábbi kijelzés érvénytelen"
     }
 
@@ -448,7 +481,7 @@ class MainActivity : Activity() {
         val sequence = if (oxygenMode.isChecked) LivePlan.oxygenSequence(available) else LivePlan.sequence(available)
         if (sequence.isEmpty()) { values.text = "Ehhez a mérési módhoz nincs támogatott PID"; return }
         telemetry = PollingTelemetry()
-        measuring = true; activeSequence = sequence; latest.clear()
+        measuring = true; activeSequence = sequence; latest.clear(); latestValues.clear(); activeSupported = available
         oxygenChart.start(simulated, available, SystemClock.elapsedRealtime())
         renderLatest(sequence)
         scheduleReading(generation.get(), readingGeneration.incrementAndGet(), sequence, 0, simulated)
@@ -469,7 +502,8 @@ class MainActivity : Activity() {
                     telemetry.success(sample, at, TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started))
                     appendRecording(sample, at, token)
                     show(token) { if (measuring && readingToken == readingGeneration.get()) {
-                        latest[pid] = sample.reading to at; oxygenChart.sample(sample, at); renderLatest(sequence)
+                        latest[pid] = sample.reading to at; latestValues[pid] = sample.value to at
+                        oxygenChart.sample(sample, at); renderLatest(sequence)
                     } }
                 }
             } catch (e: Exception) {
@@ -477,7 +511,7 @@ class MainActivity : Activity() {
                     telemetry.failure(pid, SystemClock.elapsedRealtime(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started))
                     appendRecordingFailure(pid, e.message ?: "Ismeretlen hiba", SystemClock.elapsedRealtime(), token)
                     show(token) { if (measuring && readingToken == readingGeneration.get()) {
-                        latest.remove(pid); oxygenChart.gap(pid)
+                        latest.remove(pid); latestValues.remove(pid); oxygenChart.gap(pid)
                         renderLatest(sequence, "%02X: nincs érvényes friss mérés • %s".format(pid, e.message))
                     } }
                 }
@@ -497,6 +531,10 @@ class MainActivity : Activity() {
             if (age > LivePlan.staleAfterMs(pid, sequence, avgPollMs)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
         }
         values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + "\n" + samplingSummary(now) + (note?.let { "\n$it" } ?: "")
+        // A value outside the current polling plan cannot be current, so it counts as stale at once.
+        instruments.update(activeSupported, latestValues, now) { pid -> if (pid in sequence) LivePlan.staleAfterMs(pid, sequence, avgPollMs) else -1L }
+        gaugeInfo.text = (if (demo.isChecked) "DEMO / SZIMULÁLT adatok" else "VALÓDI ECU: ${elm.selectedSource}") +
+            " • ${if (oxygenMode.isChecked) "gyors szondamérés (csak B1S1, B1S2)" else "teljes profil"}. Lapozz oldalra a két műszeroldal között."
     }
 
     private fun startRecording() {
@@ -831,6 +869,8 @@ class MainActivity : Activity() {
                 if(e.sample == null) "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error)
                 else "${if(age > 5000) "ELAVULT • " else ""}${e.sample.reading} (${age} ms)"
             } + "\nMotorállapot: " + contextLabel(s.events.lastOrNull()?.metrics)
+            instruments.update(s.supported, lastByPid.associate { it.pid to (it.sample?.value to it.atMs) }, now) { 5_000L }
+            gaugeInfo.text = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU: ${s.source}") + " • folyamatos mérés, a képernyő kikapcsolható"
             recordingInfo.text = "A folyamatos mérés saját CSV-be rögzít. Leállítás után a mentett mérések között találod."
         } else {
             oxygenChart.pause(s.events.lastOrNull()?.atMs ?: now)
@@ -865,6 +905,8 @@ class MainActivity : Activity() {
         if (recording == null && !recordStartPending) refreshRecordingSummary()
     }
     override fun onStop() { active = false; ui.removeCallbacks(ageTick); resetSession(if(DriveService.state.active) "A folyamatos mérés az értesítésben tovább fut" else "Az alkalmazás háttérbe került; új kapcsolódás szükséges"); super.onStop() }
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() { if (!dashboard.back()) @Suppress("DEPRECATION") super.onBackPressed() }
     override fun onDestroy() { active = false; elm.close(); worker.shutdown(); super.onDestroy() }
 }
 

@@ -18,19 +18,26 @@ import java.util.concurrent.TimeUnit
 @Config(sdk = [28, 35])
 @LooperMode(LooperMode.Mode.PAUSED)
 class DashboardUiTest {
+    private val destinations = 0..4
     private fun view(activity: MainActivity, tag: String): View = activity.window.decorView.findViewWithTag(tag)
     private fun field(activity: MainActivity, name: String) = MainActivity::class.java.getDeclaredField(name).apply { isAccessible = true }.get(activity)
 
-    @Test fun everyDestinationIsReachableAndStatusAlwaysRemainsVisible() {
+    @Test fun startsOnTheMainMenuAndEveryDestinationIsReachableAndReturnsToIt() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         try {
             val activity = controller.get()
-            for (selected in 0..3) {
+            assertEquals(View.VISIBLE, view(activity, "dashboard-home").visibility)
+            for (page in destinations) assertEquals(View.GONE, view(activity, "dashboard-page-$page").visibility)
+            for (selected in destinations) {
                 view(activity, "dashboard-tab-$selected").performClick()
-                for (page in 0..3) assertEquals(if (page == selected) View.VISIBLE else View.GONE,
+                assertEquals(View.GONE, view(activity, "dashboard-home").visibility)
+                for (page in destinations) assertEquals(if (page == selected) View.VISIBLE else View.GONE,
                     view(activity, "dashboard-page-$page").visibility)
                 assertTrue(view(activity, "dashboard-status").isShown)
                 assertTrue(view(activity, "dashboard-tab-$selected").isSelected)
+                if (selected % 2 == 0) view(activity, "dashboard-menu").performClick() else activity.onBackPressed()
+                assertEquals(View.VISIBLE, view(activity, "dashboard-home").visibility)
+                assertFalse(activity.isFinishing)
             }
         } finally { controller.pause().stop().destroy() }
     }
@@ -42,6 +49,7 @@ class DashboardUiTest {
         val restored = Robolectric.buildActivity(MainActivity::class.java).create(state).start().restoreInstanceState(state).resume().visible()
         try {
             assertEquals(View.VISIBLE, view(restored.get(), "dashboard-page-2").visibility)
+            assertEquals(View.GONE, view(restored.get(), "dashboard-home").visibility)
             assertTrue(view(restored.get(), "dashboard-tab-2").isSelected)
         } finally { restored.pause().stop().destroy() }
     }
@@ -56,6 +64,7 @@ class DashboardUiTest {
             shadowOf(Looper.getMainLooper()).idle()
             val recording = field(activity, "recording")
             assertNotNull(recording)
+            view(activity, "dashboard-menu").performClick()
             view(activity, "dashboard-tab-2").performClick()
             assertSame(recording, field(activity, "recording"))
             assertEquals(true, field(activity, "measuring"))

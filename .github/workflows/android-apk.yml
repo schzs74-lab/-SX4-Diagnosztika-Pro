@@ -1,7 +1,7 @@
 name: Android APK fordítás
 on:
   pull_request:
-    branches: [main, codex/sx4-side-by-side-test, claude/sx4-polish]
+    branches: [main, codex/sx4-side-by-side-test, claude/sx4-polish, codex/friendly-dashboard]
   workflow_dispatch:
   push:
     branches: [main]
