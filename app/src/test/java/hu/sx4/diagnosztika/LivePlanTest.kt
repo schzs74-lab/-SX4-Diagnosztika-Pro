@@ -19,6 +19,17 @@ class LivePlanTest {
             assertTrue(listOf(1, 2, 4).any { len -> runCatching { Obd.reading(pid, List(len) { 128 }) }.isSuccess })
         }
     }
+    @Test fun dashboardPlanAsksForEngineSpeedEveryThirdRequest() {
+        val supported = setOf(0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F, 0x11, 0x14, 0x15)
+        val seq = LivePlan.prioritized(supported)
+        assertEquals(0x0C, seq.first())
+        assertEquals(3, LivePlan.pollsBetween(0x0C, seq))
+        // Nothing the ECU supports is dropped, nothing unsupported is added.
+        assertEquals(LivePlan.sequence(supported).toSet(), seq.toSet())
+        assertEquals(LivePlan.sequence(supported).count { it != 0x0C }, seq.count { it != 0x0C })
+        assertEquals(LivePlan.sequence(setOf(0x05)), LivePlan.prioritized(setOf(0x05)))
+        assertEquals(listOf(0x0C), LivePlan.prioritized(setOf(0x0C)))
+    }
     @Test fun displayOrderAndStaleLimits() {
         assertEquals(listOf(0x0C, 0x05), LivePlan.displayed(setOf(0x05, 0x0C)))
     }

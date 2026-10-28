@@ -31,9 +31,9 @@ class OxygenChartView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        paint.style = Paint.Style.FILL; paint.color = Color.rgb(241, 246, 249)
+        paint.style = Paint.Style.FILL; paint.color = GaugeView.PANEL
         canvas.drawRoundRect(RectF(0f, 0f, width.toFloat(), height.toFloat()), 12*d, 12*d, paint)
-        fun text(value: String, x: Float, y: Float, color: Int = Color.rgb(35, 56, 68), size: Float = 12f) {
+        fun text(value: String, x: Float, y: Float, color: Int = Color.rgb(201, 211, 218), size: Float = 12f) {
             paint.style = Paint.Style.FILL; paint.color = color; paint.textSize = size*font
             canvas.drawText(value, x, y, paint)
         }
@@ -43,11 +43,11 @@ class OxygenChartView(context: Context) : View(context) {
         if (right <= left) return
         for ((index, pid) in listOf(0x14, 0x15).withIndex()) {
             val top = (52 + index*112)*d; val bottom = top + 80*d
-            val color = if (index == 0) Color.rgb(91, 69, 178) else Color.rgb(0, 119, 124)
+            val color = if (index == 0) Color.rgb(185, 168, 255) else Color.rgb(95, 211, 216)
             text(if (index == 0) "B1S1 • első szonda" else "B1S2 • második szonda", 14*d, top - 8*d, color)
             for (v in listOf(0.0, 0.6, 1.2)) {
                 val y = bottom - (v/1.3 * (bottom-top)).toFloat()
-                paint.color = Color.rgb(210, 221, 228); paint.strokeWidth = d
+                paint.color = GaugeView.LINE; paint.strokeWidth = d
                 canvas.drawLine(left, y, right, y, paint)
                 text(java.lang.String.format(java.util.Locale.ROOT, "%.1f", v), 8*d, y + 4*d, size = 10f)
             }

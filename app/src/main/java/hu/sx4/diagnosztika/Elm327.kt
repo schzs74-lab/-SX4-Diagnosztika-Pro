@@ -23,6 +23,12 @@ class Elm327 {
     val selectedSource: String? get() = selection?.source
     val supported: Set<Int> get() = selection?.supported ?: emptySet()
     @Volatile private var protocolNumber = 0
+    /**
+     * With exactly one CAN responder, "01xx1" tells the adapter to return after the first reply instead of
+     * waiting out its timeout for further ECUs. Enabled only after a probe proves the adapter supports it.
+     */
+    @Volatile var singleResponse = false
+        private set
     @Volatile private var session = 0L
     @Volatile var connectionId: String = ""
         private set
@@ -105,6 +111,12 @@ class Elm327 {
                 }
             }
             selection = ecuSources.entries.singleOrNull()?.let { Selection(it.key, it.value) }
+            singleResponse = false
+            val only = selection
+            if (canProtocol && only != null) singleResponse = try {
+                val probe = EcuChannel.selected(exchange("01001", 3500), "0100", protocol, only.source)
+                probe != "NO DATA" && Obd.pids(probe) == only.supported.filter { it in 1..0x20 }.toSet()
+            } catch (e: Exception) { if (socket !== s || s.isClosed) throw e; false }
             check(!cancelled() && socket === s && !s.isClosed) { "Megszakított kapcsolódás" }
             ready = true
             "$id • protokoll: ${protocol.toString(16).uppercase(Locale.ROOT)} • ${ecuSources.size} ECU válaszolt"
@@ -118,7 +130,8 @@ class Elm327 {
         require(cmd in setOf("ATI", "ATDPN", "ATRV", "03", "07", "0A", "0900", "0902", "0904", "0906", "090A") ||
             cmd.matches(Regex("01[0-9A-F]{2}|02[0-9A-F]{2}00"))) { "Nem engedélyezett parancs" }
         val selected = if (ready && !cmd.startsWith("AT")) selection ?: error("Előbb válassz vezérlőt") else null
-        val response = exchange(cmd, timeoutMs)
+        val fast = selected != null && singleResponse && cmd.matches(Regex("01[0-9A-F]{2}"))
+        val response = exchange(if (fast) cmd + "1" else cmd, timeoutMs)
         if (selected == null) response else EcuChannel.selected(response, cmd, protocolNumber, selected.source)
     }
 
@@ -162,7 +175,7 @@ class Elm327 {
 
     fun disconnect() {
         val previous = synchronized(stateLock) {
-            ready = false; selection = null; ecuSources = emptyMap(); session++
+            ready = false; selection = null; ecuSources = emptyMap(); singleResponse = false; session++
             val old = socket; socket = null; old
         }
         try { previous?.close() } catch (_: IOException) {}

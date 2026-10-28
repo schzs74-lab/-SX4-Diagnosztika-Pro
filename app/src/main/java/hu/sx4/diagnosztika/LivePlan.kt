@@ -19,6 +19,17 @@ object LivePlan {
         return if (s.isEmpty()) f else s.flatMap { f + it }
     }
 
+    /**
+     * Dashboard plan: the [sequence] with engine speed before every second other request, so the
+     * tachometer refreshes every third poll instead of once per fast group.
+     */
+    fun prioritized(supported: Set<Int>): List<Int> {
+        val base = sequence(supported)
+        if (0x0C !in base) return base
+        val others = base.filter { it != 0x0C }
+        return if (others.isEmpty()) listOf(0x0C) else others.chunked(2).flatMap { listOf(0x0C) + it }
+    }
+
     /** Display order: fast group first, then slow. */
     fun displayed(supported: Set<Int>): List<Int> = (fast + slow).filter { it in supported }
 

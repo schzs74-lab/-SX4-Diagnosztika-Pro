@@ -1,11 +1,11 @@
 package hu.sx4.diagnosztika
 
-/** One worker owns this recorder, the command stream and its file. Android lifecycle is outside it. */
+/** One worker owns this recorder, the command stream and its file (none in live-only mode). Android lifecycle is outside it. */
 class DriveRecorder(
     private val send: (String) -> String,
     supported: Set<Int>,
     oxygenOnly: Boolean,
-    private val log: MeasurementLog,
+    private val log: MeasurementLog?,
     private val elapsed: () -> Long,
     private val current: () -> Boolean = { true },
 ) {
@@ -14,7 +14,7 @@ class DriveRecorder(
     val sequence = if (oxygenOnly) {
         // Context is refreshed in the fast profile too. Unsupported PIDs are never invented.
         listOf(12, 3).filter { it in supported } + List(3) { listOf(20, 21).filter { it in supported } }.flatten()
-    } else LivePlan.sequence(supported).let { list -> listOf(12, 3).filter { it in supported } + list.filter { it !in setOf(12, 3) } }
+    } else LivePlan.prioritized(supported) // RPM every third request; 03 stays in the slow group
     private var index = 0
     var limitReached = false
         private set
@@ -35,8 +35,11 @@ class DriveRecorder(
             Event(pid, at, null, e.message ?: "Ismeretlen válaszhiba", telemetry.failure(pid, at, at-before))
         }
         check(current()) { "Megszakított mérés" }
-        val accepted = if (event.sample != null) log.append(event.sample, event.atMs, event.metrics)
-            else log.failure(pid, event.error!!, event.atMs, event.metrics)
+        val accepted = when {
+            log == null -> true
+            event.sample != null -> log.append(event.sample, event.atMs, event.metrics)
+            else -> log.failure(pid, event.error!!, event.atMs, event.metrics)
+        }
         limitReached = !accepted
         return event
     }
