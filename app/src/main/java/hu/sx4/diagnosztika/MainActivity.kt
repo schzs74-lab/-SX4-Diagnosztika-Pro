@@ -157,7 +157,11 @@ class MainActivity : Activity() {
             root.addView(this)
         }
         title("Élő motoradatok")
-        values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
+        // One display line per value, never wrapped: a changing number or age cannot reflow the page.
+        values = TextView(this).apply {
+            textSize = 15f; text = "Még nincs mérés"; setHorizontallyScrolling(true)
+            typeface = android.graphics.Typeface.MONOSPACE; root.addView(this)
+        }
         TextView(this).apply {
             text = "Az élő mérés értesítéssel, háttérben fut: kikapcsolt képernyővel és menüváltáskor is folytatódik, amíg le nem állítod."
             root.addView(this)
@@ -483,7 +487,7 @@ class MainActivity : Activity() {
         if (!simulated && !elm.isConnected()) { status.text = "Előbb csatlakozz az adapterhez"; return }
         if (!simulated && elm.selectedSource == null) { status.text = "Előbb válassz vezérlőt"; chooseEcu(); return }
         val available = if (simulated) DemoSamples.supported else elm.supported
-        val sequence = if (oxygenMode.isChecked) LivePlan.oxygenSequence(available) else LivePlan.sequence(available)
+        val sequence = if (oxygenMode.isChecked) LivePlan.oxygenSequence(available) else LivePlan.prioritized(available)
         if (sequence.isEmpty()) { values.text = "Ehhez a mérési módhoz nincs támogatott PID"; return }
         telemetry = PollingTelemetry()
         measuring = true; activeSequence = sequence; latest.clear(); latestValues.clear(); activeSupported = available
@@ -533,7 +537,7 @@ class MainActivity : Activity() {
         val lines = LivePlan.displayed(sequence.toSet()).map { pid ->
             val entry = latest[pid] ?: return@map "%02X: még nincs érvényes adat".format(pid)
             val age = now - entry.second
-            if (age > LivePlan.staleAfterMs(pid, sequence, avgPollMs)) "ELAVULT (${age / 1000} s): ${entry.first}" else "${entry.first}  (${age} ms)"
+            ageLine(age, age > LivePlan.staleAfterMs(pid, sequence, avgPollMs), entry.first)
         }
         values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + "\n" + samplingSummary(now) + "\n" + (note ?: " ")
         // A value outside the current polling plan cannot be current, so it counts as stale at once.
@@ -876,8 +880,8 @@ class MainActivity : Activity() {
             val lastByPid = s.events.groupBy { it.pid }.values.map { it.last() }.sortedBy { it.pid }
             values.text = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • folyamatos mérés\n" + lastByPid.joinToString("\n") { e ->
                 val age = now-e.atMs
-                if(e.sample == null) "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error)
-                else "${if(age > staleAfter(e.pid)) "ELAVULT • " else ""}${e.sample.reading} (${age} ms)"
+                if(e.sample == null) ageLine(age, true, "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error))
+                else ageLine(age, age > staleAfter(e.pid), e.sample.reading)
             } + "\nMotorállapot: " + contextLabel(s.events.lastOrNull()?.metrics)
             instruments.update(s.supported, lastByPid.associate { it.pid to (it.sample?.value to it.atMs) }, now, staleAfter)
             val info = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU: ${s.source}") +
@@ -893,6 +897,11 @@ class MainActivity : Activity() {
             finishedDriveId = s.id
         }
     }
+
+    /** Fixed-width age column first, so it stays visible when a long reading is cut at the screen edge. */
+    private fun ageLine(ageMs: Long, stale: Boolean, reading: String): String =
+        String.format(java.util.Locale.ROOT, "%5.1f s", ageMs / 1000.0).replace('.', ',') +
+            (if (stale) " ELAVULT " else "  ") + reading
 
     private fun contextLabel(m: PollingTelemetry.Metrics?): String = when(m?.context) {
         "MOTOR_ALL" -> "motor áll"

@@ -21,6 +21,16 @@ class DriveRecorderTest {
             assertTrue(text.contains("\"OK\""));assertFalse(commands.contains("04"))
         } finally { if(!log.closed) log.abort();dir.deleteRecursively() }
     }
+    @Test fun fullProfileRefreshesEngineSpeedEveryThirdRequest() {
+        val supported=setOf(0x03,0x04,0x05,0x06,0x07,0x0C,0x0D,0x0E,0x0F,0x11,0x14,0x15)
+        val sent=mutableListOf<String>();var now=0L
+        val r=DriveRecorder({cmd->sent+=cmd;now+=100;"NO DATA"},supported,false,null,{now})
+        repeat(60){r.step()}
+        val rpmAt=sent.withIndex().filter{it.value=="010C"}.map{it.index}
+        assertTrue(rpmAt.size >= 20)
+        assertTrue(rpmAt.zipWithNext{a,b->b-a}.all{it<=3})
+        assertTrue(sent.contains("0103"))
+    }
     @Test fun liveOnlyRecorderMeasuresWithoutALogAndNeverHitsTheFileLimit() {
         var now=1000L
         val r=DriveRecorder({now+=40;"41 0C 0C 30"},setOf(12),false,null,{now})

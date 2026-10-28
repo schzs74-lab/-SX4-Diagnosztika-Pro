@@ -59,6 +59,39 @@ class Elm327Test {
             } finally { elm.close() }
         }
     }
+    @Test fun singleCanResponderUsesTheFirstReplyShortcutOnlyAfterAProbe() {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<String>()
+        Adapter { cmd, sock ->
+            seen += cmd
+            val reply = when (cmd) { "01001" -> "7E8 06 41 00 00 10 00 00"; "010C1" -> "7E8 04 41 0C 0C 30"; else -> null }
+            reply?.let { sock.getOutputStream().write("$it\r>".toByteArray()); sock.getOutputStream().flush(); true } ?: false
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                assertTrue(elm.singleResponse)
+                assertEquals(listOf(0x0C, 0x30), Obd.bytesFor(elm.command("010C"), 1, 0x0C))
+                assertTrue(seen.contains("010C1")); assertFalse(seen.contains("010C"))
+                elm.disconnect(); assertFalse(elm.singleResponse)
+            } finally { elm.close() }
+        }
+    }
+    @Test fun adapterWithoutTheShortcutKeepsPlainRequests() {
+        val seen = java.util.concurrent.CopyOnWriteArrayList<String>()
+        Adapter { cmd, sock ->
+            seen += cmd
+            val reply = when (cmd) { "01001" -> "?"; "010C" -> "7E8 04 41 0C 0C 30"; else -> null }
+            reply?.let { sock.getOutputStream().write("$it\r>".toByteArray()); sock.getOutputStream().flush(); true } ?: false
+        }.use { adapter ->
+            val elm = Elm327()
+            try {
+                adapter.connect(elm)
+                assertFalse(elm.singleResponse); assertTrue(elm.isConnected())
+                assertEquals(listOf(0x0C, 0x30), Obd.bytesFor(elm.command("010C"), 1, 0x0C))
+                assertFalse(seen.contains("010C1"))
+            } finally { elm.close() }
+        }
+    }
     @Test fun bannerSentOnAcceptDoesNotShiftReplies() {
         Adapter("\r\rELM327 v1.5\r\r>") { _, _ -> false }.use { adapter ->
             val elm = Elm327()

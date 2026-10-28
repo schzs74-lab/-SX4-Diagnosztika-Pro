@@ -14,7 +14,7 @@ class DriveRecorder(
     val sequence = if (oxygenOnly) {
         // Context is refreshed in the fast profile too. Unsupported PIDs are never invented.
         listOf(12, 3).filter { it in supported } + List(3) { listOf(20, 21).filter { it in supported } }.flatten()
-    } else LivePlan.sequence(supported).let { list -> listOf(12, 3).filter { it in supported } + list.filter { it !in setOf(12, 3) } }
+    } else LivePlan.prioritized(supported) // RPM every third request; 03 stays in the slow group
     private var index = 0
     var limitReached = false
         private set

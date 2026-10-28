@@ -1,5 +1,6 @@
 package hu.sx4.diagnosztika
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
@@ -17,13 +18,30 @@ class GaugeView(context: Context, val spec: GaugeSpec, private val digital: Bool
     private val d = resources.displayMetrics.density
     var reading: GaugeReading = GaugeReading.NoData
         private set
+    /** Needle position actually drawn; glides to each new sample instead of jumping. NaN = no needle. */
+    private var needle = Float.NaN
+    private var glide: ValueAnimator? = null
 
     init { tag = "gauge-%02X".format(spec.pid); describe() }
 
     fun show(next: GaugeReading) {
         if (next == reading) return
-        reading = next; describe(); invalidate()
+        val target = (next as? GaugeReading.Value)?.let { Gauges.fraction(spec, it.value).toFloat() } ?: Float.NaN
+        val moved = (reading as? GaugeReading.Value)?.value != (next as? GaugeReading.Value)?.value
+        reading = next; describe()
+        if (moved) {
+            glide?.cancel(); glide = null
+            if (needle.isNaN() || target.isNaN() || digital) needle = target
+            else glide = ValueAnimator.ofFloat(needle, target).apply {
+                duration = GLIDE_MS
+                addUpdateListener { needle = it.animatedValue as Float; invalidate() }
+                start()
+            }
+        }
+        invalidate()
     }
+
+    override fun onDetachedFromWindow() { glide?.cancel(); glide = null; super.onDetachedFromWindow() }
 
     private fun describe() {
         contentDescription = spec.label + ": " + when (val r = reading) {
@@ -93,8 +111,8 @@ class GaugeView(context: Context, val spec: GaugeSpec, private val digital: Bool
             paint.color = RED; canvas.drawArc(oval, START + f * SWEEP, (1 - f) * SWEEP, false, paint)
         }
         val value = (reading as? GaugeReading.Value)?.value
-        if (value != null) {
-            val f = Gauges.fraction(spec, value).toFloat()
+        val f = needle
+        if (value != null && !f.isNaN()) {
             val from = if (spec.centered) Gauges.fraction(spec, 0.0).toFloat() else 0f
             paint.color = if (stale) DIM else ACCENT
             canvas.drawArc(oval, START + min(from, f) * SWEEP, kotlin.math.abs(f - from) * SWEEP, false, paint)
@@ -118,8 +136,8 @@ class GaugeView(context: Context, val spec: GaugeSpec, private val digital: Bool
                     (if (big) 13 else 10) * d, TICK)
             }
         }
-        if (value != null) {
-            val a = Math.toRadians((START + SWEEP * Gauges.fraction(spec, value)).toDouble())
+        if (value != null && !f.isNaN()) {
+            val a = Math.toRadians((START + SWEEP * f).toDouble())
             val tip = track - 12 * d
             paint.style = Paint.Style.STROKE; paint.strokeWidth = 3 * d; paint.strokeCap = Paint.Cap.ROUND
             paint.color = if (stale) DIM else NEEDLE
@@ -140,6 +158,8 @@ class GaugeView(context: Context, val spec: GaugeSpec, private val digital: Bool
 
     companion object {
         private const val START = 135f
+        /** Close to one dashboard refresh, so the needle keeps moving between samples. */
+        private const val GLIDE_MS = 250L
         private const val SWEEP = 270f
         val INK = Color.rgb(237, 242, 245)
         val MUTED = Color.rgb(140, 154, 165)
