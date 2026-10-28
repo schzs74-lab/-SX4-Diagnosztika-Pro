@@ -149,6 +149,7 @@ internal class DashboardUi(private val activity: Activity) {
     fun add(page: Int, view: View) { bodies[page].addView(view, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) }) }
 
     fun decorate(view: View) {
+        if (view.tag == LiveTable.TAG) return // sizes and colours are its own (auto-sized rows)
         when (view) {
             is EditText -> {
                 view.textSize = 16f; view.setTextColor(ink); view.setHintTextColor(muted)

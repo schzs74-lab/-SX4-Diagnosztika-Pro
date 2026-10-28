@@ -75,7 +75,9 @@ class MainActivityTest {
             val latest = get(activity, "latest") as MutableMap<Int, Pair<String, Long>>
             latest[12] = "Fordulatszám: 800 1/perc" to SystemClock.elapsedRealtime()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
-            assertTrue(text(activity, "values").contains("ELAVULT"))
+            val table = get(activity, "liveTable") as LiveTable
+            assertTrue(table.text().contains("ELAVULT"))
+            assertTrue(table.rows.first { it.text.contains("Fordulatszám") }.warn)
         } finally { controller.pause().stop().destroy() }
     }
 

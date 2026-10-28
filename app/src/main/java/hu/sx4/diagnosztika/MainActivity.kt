@@ -52,6 +52,7 @@ class MainActivity : Activity() {
     private lateinit var gaugeInfo: TextView
     private lateinit var status: TextView
     private lateinit var values: TextView
+    private lateinit var liveTable: LiveTable
     private lateinit var errors: TextView
     private lateinit var statusReport: TextView
     private lateinit var identity: TextView
@@ -157,11 +158,9 @@ class MainActivity : Activity() {
             root.addView(this)
         }
         title("Élő motoradatok")
-        // One display line per value, never wrapped: a changing number or age cannot reflow the page.
-        values = TextView(this).apply {
-            textSize = 15f; text = "Még nincs mérés"; setHorizontallyScrolling(true)
-            typeface = android.graphics.Typeface.MONOSPACE; root.addView(this)
-        }
+        values = TextView(this).apply { textSize = 17f; text = "Még nincs mérés"; root.addView(this) }
+        // Fixed-height rows that shrink long text: changing numbers or ages cannot reflow the page.
+        liveTable = LiveTable(this).also { root.addView(it, LinearLayout.LayoutParams(-1, -2)) }
         TextView(this).apply {
             text = "Az élő mérés értesítéssel, háttérben fut: kikapcsolt képernyővel és menüváltáskor is folytatódik, amíg le nem állítod."
             root.addView(this)
@@ -212,7 +211,7 @@ class MainActivity : Activity() {
         oxygenMode.setOnCheckedChangeListener { _, _ ->
             pauseMeasurement("mérési mód váltása")
             latest.clear(); latestValues.clear(); instruments.clear(); oxygenChart.reset()
-            values.text = "Mérési mód megváltozott • indítsd újra az élő adatokat"
+            values.text = "Mérési mód megváltozott • indítsd újra az élő adatokat"; liveTable.show(emptyList())
         }
         title("Folyamatos mérés • kikapcsolt képernyővel is")
         drivingInfo = TextView(this).apply { textSize = 16f; text = "Nincs folyamatos mérés"; minLines = 5; root.addView(this) }
@@ -289,7 +288,7 @@ class MainActivity : Activity() {
         networkCallback?.let { try { cm.unregisterNetworkCallback(it) } catch (_: IllegalArgumentException) {} }
         networkCallback = null
         status.text = sessionStatus(message)
-        values.text = "Nincs érvényes mérés"
+        values.text = "Nincs érvényes mérés"; liveTable.show(emptyList())
         errors.text = "Nincs érvényes hibakód-kiolvasás"
         statusReport.text = "Nincs érvényes állapot-kiolvasás"
         identity.text = "Nincs érvényes azonosító-kiolvasás"
@@ -413,7 +412,7 @@ class MainActivity : Activity() {
                 oxygenChart.reset()
                 elm.selectEcu(sources[index])
                 latest.clear(); latestValues.clear(); instruments.clear()
-                values.text = "Új vezérlő • nincs érvényes mérés"
+                values.text = "Új vezérlő • nincs érvényes mérés"; liveTable.show(emptyList())
                 errors.text = "Új vezérlő • nincs érvényes hibakód-kiolvasás"
                 statusReport.text = "Új vezérlő • nincs érvényes állapot-kiolvasás"
                 identity.text = "Új vezérlő • nincs érvényes azonosító-kiolvasás"
@@ -429,7 +428,7 @@ class MainActivity : Activity() {
         measuring = false; readingGeneration.incrementAndGet(); poll?.cancel(false)
         oxygenChart.pause(SystemClock.elapsedRealtime())
         latestValues.clear(); instruments.clear()
-        values.text = "Mérés szünetel: $reason • a korábbi kijelzés érvénytelen"
+        values.text = "Mérés szünetel: $reason • a korábbi kijelzés érvénytelen"; liveTable.show(emptyList())
     }
 
     private fun connectWifi() {
@@ -535,11 +534,12 @@ class MainActivity : Activity() {
     private fun renderLatest(sequence: List<Int>, note: String? = null) {
         val now = SystemClock.elapsedRealtime()
         val lines = LivePlan.displayed(sequence.toSet()).map { pid ->
-            val entry = latest[pid] ?: return@map "%02X: még nincs érvényes adat".format(pid)
+            val entry = latest[pid] ?: return@map LiveTable.Row("", "%02X: még nincs érvényes adat".format(pid))
             val age = now - entry.second
-            ageLine(age, age > LivePlan.staleAfterMs(pid, sequence, avgPollMs), entry.first)
+            ageRow(age, age > LivePlan.staleAfterMs(pid, sequence, avgPollMs), entry.first)
         }
-        values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva\n" + lines.joinToString("\n") + "\n" + samplingSummary(now) + "\n" + (note ?: " ")
+        values.text = (if (demo.isChecked) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • PID-enként külön időpontban olvasva"
+        liveTable.show(lines + samplingSummary(now).lines().map { LiveTable.Row("", it) } + LiveTable.Row("", note ?: "", warn = note != null))
         // A value outside the current polling plan cannot be current, so it counts as stale at once.
         instruments.update(activeSupported, latestValues, now) { pid -> if (pid in sequence) LivePlan.staleAfterMs(pid, sequence, avgPollMs) else -1L }
         gaugeInfo.text = (if (demo.isChecked) "DEMO / SZIMULÁLT adatok" else "VALÓDI ECU: ${elm.selectedSource}") +
@@ -878,11 +878,13 @@ class MainActivity : Activity() {
             val avg = s.avgPollMs()
             val staleAfter = { pid: Int -> if (pid in s.sequence) LivePlan.staleAfterMs(pid, s.sequence, avg) else -1L }
             val lastByPid = s.events.groupBy { it.pid }.values.map { it.last() }.sortedBy { it.pid }
-            values.text = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • folyamatos mérés\n" + lastByPid.joinToString("\n") { e ->
+            val header = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU") + " • folyamatos mérés"
+            if (values.text.toString() != header) values.text = header
+            liveTable.show(lastByPid.map { e ->
                 val age = now-e.atMs
-                if(e.sample == null) ageLine(age, true, "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error))
-                else ageLine(age, age > staleAfter(e.pid), e.sample.reading)
-            } + "\nMotorállapot: " + contextLabel(s.events.lastOrNull()?.metrics)
+                if(e.sample == null) ageRow(age, true, "%02X: nincs érvényes friss minta • %s".format(e.pid, e.error))
+                else ageRow(age, age > staleAfter(e.pid), e.sample.reading)
+            } + LiveTable.Row("", "Motorállapot: " + contextLabel(s.events.lastOrNull()?.metrics)))
             instruments.update(s.supported, lastByPid.associate { it.pid to (it.sample?.value to it.atMs) }, now, staleAfter)
             val info = (if(s.demo) "DEMO / SZIMULÁLT" else "VALÓDI ECU: ${s.source}") +
                 (if (s.recording) " • rögzítés CSV-be" else " • élő mérés") + ", a képernyő kikapcsolható\n" + s.message.lineSequence().first()
@@ -898,10 +900,10 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Fixed-width age column first, so it stays visible when a long reading is cut at the screen edge. */
-    private fun ageLine(ageMs: Long, stale: Boolean, reading: String): String =
-        String.format(java.util.Locale.ROOT, "%5.1f s", ageMs / 1000.0).replace('.', ',') +
-            (if (stale) " ELAVULT " else "  ") + reading
+    /** Age in seconds for the table's fixed column; an old value is marked in its own text, not only by colour. */
+    private fun ageRow(ageMs: Long, stale: Boolean, reading: String) = LiveTable.Row(
+        String.format(java.util.Locale.ROOT, "%.1f s", ageMs / 1000.0).replace('.', ','),
+        if (stale) "ELAVULT • $reading" else reading, warn = stale)
 
     private fun contextLabel(m: PollingTelemetry.Metrics?): String = when(m?.context) {
         "MOTOR_ALL" -> "motor áll"
