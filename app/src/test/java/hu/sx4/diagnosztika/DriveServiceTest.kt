@@ -57,6 +57,26 @@ class DriveServiceTest {
             assertEquals(1,MeasurementLog.saved(File(s.filesDir,"measurements")).size)
         } finally {c.destroy()}
     }
+    @Test fun liveModeKeepsMeasuringAcrossActivityLifecycleWithoutWritingCsv() {
+        val c=Robolectric.buildService(DriveService::class.java).create();val s=c.get()
+        try {
+            s.onStartCommand(Intent(s,DriveService::class.java).setAction(DriveService.START).putExtra("demo",true)
+                .putExtra("oxygen",false).putExtra("record",false),0,1);settle(s)
+            repeat(6){tick(s)}
+            val state=DriveService.state
+            assertTrue(state.active);assertFalse(state.recording)
+            assertTrue(0x0C in state.sequence);assertTrue(state.events.any{it.pid==0x0C && it.sample!=null})
+            assertTrue(state.avgPollMs() > 0)
+            // Screen-off/backgrounding destroys only the activity; the service keeps polling.
+            val activity=Robolectric.buildActivity(MainActivity::class.java).setup();activity.pause().stop().destroy()
+            val before=DriveService.state.events.size;tick(s)
+            assertTrue(DriveService.state.active);assertTrue(DriveService.state.events.size >= before)
+            stop(s)
+            assertFalse(DriveService.state.active)
+            assertTrue(MeasurementLog.saved(File(s.filesDir,"measurements")).isEmpty())
+            assertTrue(DriveService.state.message.contains("nem készült CSV"))
+        } finally {c.destroy()}
+    }
     @Test fun repeatedStartAndStopNeverCreateDuplicateFilesOrLoseFinalization() {
         val c=Robolectric.buildService(DriveService::class.java).create();val s=c.get()
         try {

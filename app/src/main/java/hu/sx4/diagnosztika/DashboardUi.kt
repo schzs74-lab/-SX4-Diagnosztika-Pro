@@ -70,6 +70,9 @@ internal class DashboardUi(private val activity: Activity) {
         header.addView(bar)
         status = label("DEMO mód • nincs ECU-kapcsolat", 14f, ink).apply {
             tag = "dashboard-status"
+            // Two reserved lines: ordinary status changes must not shift the page under the finger.
+            // Not truncated, so a long safety warning (e.g. uncertain clearing) still shows in full.
+            minLines = 2
             setPadding(dp(12), dp(10), dp(12), dp(10))
             background = shape(panel, 12, line)
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE

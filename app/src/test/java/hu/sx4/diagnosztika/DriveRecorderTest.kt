@@ -21,6 +21,12 @@ class DriveRecorderTest {
             assertTrue(text.contains("\"OK\""));assertFalse(commands.contains("04"))
         } finally { if(!log.closed) log.abort();dir.deleteRecursively() }
     }
+    @Test fun liveOnlyRecorderMeasuresWithoutALogAndNeverHitsTheFileLimit() {
+        var now=1000L
+        val r=DriveRecorder({now+=40;"41 0C 0C 30"},setOf(12),false,null,{now})
+        val events=List(500){r.step()}
+        assertEquals(780.0,events.last().sample!!.value!!,0.0);assertFalse(r.limitReached)
+    }
     @Test fun delayedResponsesChangeMeasuredRateRatherThanAssumingFixedPolling() {
         val dir=Files.createTempDirectory("sx4-rate").toFile();var now=1000L
         val log=MeasurementLog(dir,"DEMO","DEMO","test","test",0,now)
